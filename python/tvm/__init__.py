@@ -110,3 +110,21 @@ def tvm_wrap_excepthook(exception_hook):
 
 
 sys.excepthook = tvm_wrap_excepthook(sys.excepthook)
+
+
+@register_func("construct_packed_params")
+def construct_packed_params(w0: nd.NDArray, w1: nd.NDArray):
+    worker_id = get_global_func("runtime.disco.worker_id")()[0]
+    if worker_id == 0:
+        assert w0.shape[1] == 256
+        return [nd.array(w0.numpy()[:, :128], w0.device), None]
+    elif worker_id == 1:
+        assert w0.shape[1] == 256
+        return [nd.array(w0.numpy()[:, 128:], w0.device), None]
+    elif worker_id == 2:
+        assert w1.shape[0] == 256
+        return [None, nd.array(w1.numpy()[:128, :], w1.device)]
+    elif worker_id == 3:
+        assert w1.shape[0] == 256
+        return [None, nd.array(w1.numpy()[128:, :], w1.device)]
+    assert False
