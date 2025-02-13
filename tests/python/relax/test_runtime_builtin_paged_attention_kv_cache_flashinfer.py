@@ -23,11 +23,16 @@ import scipy.special
 import tvm
 import tvm.testing
 from tvm import dlight as dl
+from tvm import relax
+from tvm.contrib import utils
 from tvm.relax.frontend.nn.llm.kv_cache import (
+    AttnKind,
     RopeMode,
+    _compact_kv_copy,
     _copy_single_page,
     _kv_cache_debug_get_kv,
     _kv_cache_transpose_append,
+    _merge_state_inplace,
     llama_rope_with_position_map,
 )
 from tvm.runtime import ShapeTuple
@@ -40,13 +45,13 @@ num_layers = 4
 num_qo_heads = 32
 num_kv_heads = 4
 head_dim = 128
+sm_scale = head_dim ** (-0.5)
 rope_scale = 1.0
 rope_theta = 1e4
 dtype = "float16"
 device = tvm.cuda()
 
 fclear = None
-fcreate = None
 fadd_sequence = None
 fremove_sequence = None
 ffork_sequence = None
@@ -60,33 +65,27 @@ fdebug_get_kv = None
 fattention_prefill = None
 fattention_decode = None
 fattention_prefill_ragged = None
-fattention_prefill_begin_forward = None
-fattention_prefill_end_forward = None
-fattention_decode_begin_forward = None
-fattention_decode_end_forward = None
-fattention_prefill_ragged_begin_forward = None
-fattention_prefill_ragged_end_forward = None
+fattention_prefill_plan = None
+fattention_decode_plan = None
+fattention_prefill_ragged_plan = None
 fattention_merge_state = None
 
 ftranspose_append = None
 fsplit_rotary = None
 fcopy_single_page = None
 fcopy_cache = None
+fcompact_copy = None
 
 
 def set_global_func():
-    global fclear, fcreate, fadd_sequence, fremove_sequence, ffork_sequence, fpopn
+    global fclear, fadd_sequence, fremove_sequence, ffork_sequence, fpopn
     global fbegin_forward, fend_forward, fattention, fattention_with_fuse_qkv, fdebug_get_kv
-    global fattention_prefill, fattention_prefill_begin_forward, fattention_prefill_end_forward
-    global fattention_decode, fattention_decode_begin_forward, fattention_decode_end_forward
-    global fattention_prefill_ragged
-    global fattention_prefill_ragged_begin_forward
-    global fattention_prefill_ragged_end_forward
+    global fattention_prefill, fattention_decode, fattention_prefill_ragged
+    global fattention_prefill_plan, fattention_decode_plan, fattention_prefill_ragged_plan
     global fattention_merge_state, fsplit_rotary, fcopy_single_page
-    global ftranspose_append, fcopy_cache
+    global ftranspose_append, fcopy_cache, fcompact_copy
 
     fclear = tvm.get_global_func("vm.builtin.kv_state_clear")
-    fcreate = tvm.get_global_func("vm.builtin.paged_attention_kv_cache_create")
     fadd_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
     fremove_sequence = tvm.get_global_func("vm.builtin.kv_state_remove_sequence")
     ffork_sequence = tvm.get_global_func("vm.builtin.kv_state_fork_sequence")
@@ -98,44 +97,59 @@ def set_global_func():
     )
     fdebug_get_kv = tvm.get_global_func("vm.builtin.attention_kv_cache_debug_get_kv")
 
-    fattention_prefill = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_paged_kv_cache"
-    )
-    fattention_decode = tvm.get_global_func(
-        "flashinfer.attention_kernel_decode_with_paged_kv_cache"
-    )
-    fattention_prefill_ragged = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_ragged_kv_cache"
-    )
-    fattention_prefill_begin_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_paged_kv_cache_begin_forward"
-    )
-    fattention_prefill_end_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_paged_kv_cache_end_forward"
-    )
-    fattention_decode_begin_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_decode_with_paged_kv_cache_begin_forward"
-    )
-    fattention_decode_end_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_decode_with_paged_kv_cache_end_forward"
-    )
-    fattention_prefill_ragged_begin_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_ragged_kv_cache_begin_forward"
-    )
-    fattention_prefill_ragged_end_forward = tvm.get_global_func(
-        "flashinfer.attention_kernel_prefill_with_ragged_kv_cache_end_forward"
-    )
-    fattention_merge_state = tvm.get_global_func("flashinfer.merge_state_in_place")
+    def load_module(name: str, static_modules: List[tvm.runtime.Module]):
+        assert len(static_modules) > 0
+        if len(static_modules) == 1:
+            return static_modules[0]
+        static_mod = static_modules[0]
+        for mod in static_modules[1:]:
+            static_mod.import_module(mod)
+        temp = utils.tempdir()
+        mod_path = temp.relpath(f"{name}.so")
+        static_mod.export_library(mod_path)
+        return tvm.runtime.load_module(mod_path)
 
     target = tvm.target.Target.from_device(device)
+    flashinfer_prefill_mod = load_module(
+        "flashinfer_prefill",
+        relax.backend.cuda.flashinfer.gen_flashinfer_prefill_module(
+            dtype_q=dtype,
+            dtype_kv=dtype,
+            dtype_o=dtype,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            target=target,
+        ),
+    )
+    flashinfer_decode_mod = load_module(
+        "flashinfer_decode",
+        relax.backend.cuda.flashinfer.gen_flashinfer_decode_module(
+            dtype_q=dtype,
+            dtype_kv=dtype,
+            dtype_o=dtype,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            target=target,
+        ),
+    )
+
+    fattention_prefill = flashinfer_prefill_mod["batch_prefill_with_paged_kv_cache_run"]
+    fattention_prefill_plan = flashinfer_prefill_mod["batch_prefill_with_kv_cache_plan"]
+    fattention_prefill_ragged = flashinfer_prefill_mod["batch_prefill_with_ragged_kv_cache_run"]
+    fattention_prefill_ragged_plan = flashinfer_prefill_mod["batch_prefill_with_kv_cache_plan"]
+    fattention_decode = flashinfer_decode_mod["batch_decode_with_paged_kv_cache_run"]
+    fattention_decode_plan = flashinfer_decode_mod["batch_decode_with_paged_kv_cache_plan"]
+
     builts = []
     for tir_func in [
         _kv_cache_transpose_append(num_kv_heads, head_dim, dtype),
+        _merge_state_inplace(num_qo_heads, head_dim, dtype, target),
         llama_rope_with_position_map(
             rope_theta, rope_scale, head_dim, num_qo_heads, num_kv_heads, dtype, {}
         ),
         _copy_single_page(num_kv_heads, page_size, head_dim, dtype, target),
         _kv_cache_debug_get_kv(num_layers, num_kv_heads, head_dim, dtype),
+        _compact_kv_copy(num_kv_heads, head_dim, dtype, target),
     ]:
         mod = tvm.IRModule({"main": tir_func})
         with target:
@@ -143,10 +157,18 @@ def set_global_func():
         f = tvm.build(mod["main"], target=target)
         builts.append(f.entry_func)
 
-    ftranspose_append, fsplit_rotary, fcopy_single_page, fcopy_cache = builts
+    (
+        ftranspose_append,
+        fattention_merge_state,
+        fsplit_rotary,
+        fcopy_single_page,
+        fcopy_cache,
+        fcompact_copy,
+    ) = builts
 
 
 def create_kv_cache(rope_mode):
+    fcreate = tvm.get_global_func("vm.builtin.paged_attention_kv_cache_create")
     support_sliding_window = 0
     cache = fcreate(
         tvm.runtime.ShapeTuple(
@@ -162,31 +184,29 @@ def create_kv_cache(rope_mode):
         num_qo_heads,
         num_kv_heads,
         head_dim,
+        head_dim,  # v_head_dim
+        tvm.runtime.ShapeTuple([int(AttnKind.MHA) for _ in range(num_layers)]),
+        False,  # enable_kv_transfer
         rope_mode,
         rope_scale,
         rope_theta,
+        None,  # rope_ext_factors
         tvm.nd.empty((), dtype, device=device),
         ftranspose_append,
-        fattention_prefill,
-        fattention_decode,
-        fattention_prefill,
-        fattention_decode,
-        fattention_prefill_ragged,
-        fattention_prefill_ragged_begin_forward,
-        fattention_prefill_ragged_end_forward,
-        fattention_prefill_begin_forward,
-        fattention_prefill_end_forward,
-        fattention_decode_begin_forward,
-        fattention_decode_end_forward,
-        fattention_merge_state,
+        None,  # f_transpose_append_mla
+        ["flashinfer", fattention_prefill_ragged, fattention_prefill_ragged_plan],
+        ["flashinfer", fattention_prefill, fattention_prefill_plan],
+        ["flashinfer", fattention_decode, fattention_decode_plan],
+        [],  # fattn_prefill_sliding_window
+        [],  # fattn_decode_sliding_window
+        [],  # fattn_prefill_with_tree_mask_paged_kv_cache
+        [],  # fattn_prefill_with_tree_mask
+        [],  # f_mla_prefill
+        [fattention_merge_state],
         fsplit_rotary,
         fcopy_single_page,
         fcopy_cache,
-        None,
-        None,
-        None,
-        None,
-        False,
+        fcompact_copy,
     )
     return cache
 
@@ -303,7 +323,7 @@ def apply_attention(
         values_np = global_new_v[layer_id]
         qkv = tvm.nd.array(np.concatenate([queries_np, keys_np, values_np], axis=1), device)
         outputs = tvm.nd.empty(queries_np.shape, dtype, device=device)
-        fattention_with_fuse_qkv(kv_cache, layer_id, 1.0, qkv, outputs)
+        fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
 
         # Compute attention expected results.
         outputs = np.expand_dims(outputs.numpy(), axis=0)

@@ -25,6 +25,7 @@ import tvm
 import tvm.testing
 from tvm import dlight as dl
 from tvm.relax.frontend.nn.llm.kv_cache import (
+    AttnKind,
     RopeMode,
     _attention_decode,
     _attention_prefill,
@@ -48,6 +49,7 @@ num_layers = 4
 num_qo_heads = 32
 num_kv_heads = 4
 head_dim = None
+sm_scale = None
 rope_scale = 1.0
 rope_theta = 1e4
 rope_scaling = {}
@@ -160,7 +162,7 @@ def set_global_func(head_dim, dtype):
 
 
 def create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window):
-    fcreate = tvm.get_global_func("vm.builtin.paged_attention_kv_cache_create_reduced")
+    fcreate = tvm.get_global_func("vm.builtin.paged_attention_kv_cache_create")
     cache = fcreate(
         tvm.runtime.ShapeTuple(
             [
@@ -175,25 +177,29 @@ def create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window):
         num_qo_heads,
         num_kv_heads,
         head_dim,
+        head_dim,  # v_head_dim
+        tvm.runtime.ShapeTuple([int(AttnKind.MHA) for _ in range(num_layers)]),
+        False,  # enable_kv_transfer
         rope_mode,
         rope_scale,
         rope_theta,
+        None,  # rope_ext_factors
         tvm.nd.empty((), dtype, device=device),
         ftranspose_append,
-        fattn_prefill,
-        fattn_decode,
-        fattn_prefill_sliding_window,
-        fattn_decode_sliding_window,
-        fattn_prefill_ragged,
-        fmerge_state,
+        None,  # f_transpose_append_mla
+        ["tir", fattn_prefill_ragged],
+        ["tir", fattn_prefill],
+        ["tir", fattn_decode],
+        ["tir", fattn_prefill_sliding_window],
+        ["tir", fattn_decode_sliding_window],
+        ["tir", fattn_prefill_with_tree_mask_paged_kv_cache],
+        ["tir", fattn_prefill_with_tree_mask],
+        [],  # f_mla_prefill
+        [fmerge_state],
         fsplit_rotary,
         fcopy_single_page,
         fcopy_cache,
         fcompact_copy,
-        fattn_prefill_with_tree_mask,
-        fattn_prefill_with_tree_mask_paged_kv_cache,
-        None,
-        False,
     )
     return cache
 
@@ -215,8 +221,9 @@ def create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window):
     )
 )
 def kv_cache_and_config(request):
-    global head_dim, dtype
+    global head_dim, sm_scale, dtype
     head_dim, dtype, rope_mode, support_sliding_window = request.param
+    sm_scale = head_dim ** (-0.5)
     set_global_func(head_dim, dtype)
     return create_kv_cache(*request.param), rope_mode, support_sliding_window
 
@@ -379,7 +386,7 @@ def apply_attention(
         values_np = global_new_v[layer_id]
         qkv = tvm.nd.array(np.concatenate([queries_np, keys_np, values_np], axis=1), device)
         outputs = tvm.nd.empty(queries_np.shape, dtype, device=device)
-        fattention_with_fuse_qkv(kv_cache, layer_id, 1.0, qkv, outputs)
+        fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
 
         # Compute attention expected results.
         outputs = np.expand_dims(outputs.numpy(), axis=0)
@@ -951,6 +958,7 @@ if __name__ == "__main__":
     for head_dim, dtype, rope_mode, support_sliding_window in itertools.product(
         HEAD_DIMS, DTYPES, ROPE_MODES, SUPPORT_SLIDING_WINDOW
     ):
+        sm_scale = head_dim ** (-0.5)
         set_global_func(head_dim, dtype)
         cache = create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window)
         cache_and_config = (cache, rope_mode, support_sliding_window)
