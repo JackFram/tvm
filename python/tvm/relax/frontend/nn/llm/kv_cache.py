@@ -253,7 +253,9 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
             # fmt: off
             bb.add_func(_kv_cache_transpose_append(num_key_value_heads, head_dim, dtype), "kv_cache_transpose_append"),
             rx.extern("flashinfer.attention_kernel_prefill_with_paged_kv_cache"),
+            rx.extern("flashinfer.topk_attention_kernel_prefill_with_paged_kv_cache"),
             rx.extern("flashinfer.attention_kernel_decode_with_paged_kv_cache"),
+            rx.extern("flashinfer.topk_attention_kernel_decode_with_paged_kv_cache"),
             bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window"),
             bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window"),
             rx.extern("flashinfer.attention_kernel_prefill_with_ragged_kv_cache"),

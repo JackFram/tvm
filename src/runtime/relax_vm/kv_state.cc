@@ -80,6 +80,12 @@ TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_with_fused_qkv")
       kv_cache->AttentionWithFusedQKV(layer_id, std::move(qkv_data), NullOpt, std::move(o_data),
                                       attn_score_scaling_factor);
     });
+TVM_REGISTER_GLOBAL("vm.builtin.topk_attention_kv_cache_attention_with_fused_qkv")
+    .set_body_typed([](AttentionKVCache kv_cache, int64_t layer_id,
+                       double attn_score_scaling_factor, NDArray qkv_data, NDArray o_data, NDArray qk_inner_product_data) {
+      kv_cache->TopKAttentionWithFusedQKV(layer_id, std::move(qkv_data), NullOpt, std::move(o_data), std::move(qk_inner_product_data),
+                                      attn_score_scaling_factor);
+    });
 
 // RNN State methods
 TVM_REGISTER_GLOBAL("vm.builtin.rnn_state_get").set_body_method<RNNState>(&RNNStateObj::Get);

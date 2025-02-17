@@ -182,6 +182,21 @@ class AttentionKVCacheObj : public KVStateObj {
                                      NDArray o_data, double attn_score_scaling_factor) = 0;
 
   /*!
+   * \brief Compute attention+qk_inner_product with Q/K/V data which are concatenated along
+   * the head dimension.
+   * \param layer_id The model layer where the attention compute happens.
+   * \param qkv_data The input Q/K/V data, in layout
+   * `(total_length, num_qo_heads + 2 * num_kv_heads, head_dim)`.
+   * \param mask The input mask data, in layout `(total_sqr_length)`.
+   * \param o_data The output O data, in layout `(total_length, num_qo_heads, head_dim)`.
+   * \param qk_inner_product_data The output QK inner product data, in layout `(total_length, num_qo_heads)`.
+   * \param attn_score_scaling_factor The additional attention scaling factor.
+   * \sa AttentionKVCache::Attention
+   */
+  virtual void TopKAttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data, Optional<NDArray> mask,
+                                     NDArray o_data, NDArray qk_inner_product_data, double attn_score_scaling_factor) = 0;
+
+  /*!
    * \brief Compute attention with Q/K/V data.
    * \param layer_id The model layer where the attention compute happens.
    * \param q_data The input Q data, in layout `(total_length, num_qo_heads, head_dim)`
