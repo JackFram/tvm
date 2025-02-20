@@ -1078,6 +1078,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   std::vector<HostMemoryVector> qo_indptr_on_depths_host_;
   std::vector<HostMemoryVector> page_indptr_on_depths_host_;
   std::vector<HostMemoryVector> page_indices_on_depths_host_;
+  std::vector<HostMemoryVector> topk_page_indices_on_depths_host_;
   std::vector<HostMemoryVector> last_page_len_on_depths_host_;
   std::vector<HostMemoryVector> sliding_window_offset_on_depths_host_;
   std::vector<HostMemoryVector> sink_size_on_depths_host_;
@@ -1119,6 +1120,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   std::vector<NDArray> qo_indptr_on_depths_view_;
   std::vector<NDArray> page_indptr_on_depths_view_;
   std::vector<NDArray> page_indices_on_depths_view_;
+  std::vector<NDArray> topk_page_indices_on_depths_view_;
   std::vector<NDArray> length_info_on_depths_view_;
   std::vector<NDArray> k_rope_pos_offset_view_;
   std::vector<NDArray> tree_attn_mask_view_;
@@ -1327,6 +1329,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       qo_indptr_on_depths_view_.push_back(NDArray());
       page_indptr_on_depths_view_.push_back(NDArray());
       page_indices_on_depths_view_.push_back(NDArray());
+      topk_page_indices_on_depths_view_.push_back(NDArray());
       length_info_on_depths_view_.push_back(NDArray());
       k_rope_pos_offset_view_.push_back(NDArray());
       tree_attn_mask_view_.push_back(NDArray());
@@ -1419,6 +1422,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     seq_map_.insert({seq_id, Sequence(&global_block_pool_, block_idx)});
     dirty_aux_data_device_ = true;
   }
+
+  // void UpdateTopKPageIndices(int64_t seq_id, const std::vector<int32_t>& topk_page_indices){
+  //   auto it = seq_map_.find(seq_id);
+  //   CHECK(it != seq_map_.end()) << "The sequence \"" << seq_id << "\" cannot be found in KV cache.";
+  //   it->second.topk_page_indices = topk_page_indices;
+  //   dirty_aux_data_device_ = true;
+  // }
 
   void RemoveSequence(int64_t seq_id) final {
     auto it = seq_map_.find(seq_id);
@@ -1853,6 +1863,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             page_indptr_h.push_back(page_indptr_h.back() + block.page_ids.size());
             for (int32_t page_id : block.page_ids) {
               page_indices_h.push_back(page_id);
+              printf("block_id: %d, depth: %d, page id: %d\n",block_id, d, page_id);
             }
             last_page_len_h.push_back(
                 block.seq_length == 0
@@ -2835,6 +2846,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     if (!NeedKernelBeginForward()) {
       return;
     }
+
+    // printf("KernelBeginForward\n");
 
     if (!append_before_attn_) {
       if (is_chain_on_depths_[0]) {

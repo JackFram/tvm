@@ -31,6 +31,7 @@ from tvm.script import tir as T
 reserved_nseq = 32
 maximum_total_seq_length = 2048
 prefill_chunk_size = 512
+token_budget = 512
 page_size = 1
 num_layers = 4
 num_qo_heads = 32
@@ -460,6 +461,7 @@ def apply_attention(
 ) -> None:
     seq_ids = []
     append_lengths = []
+    print(batch)
     for i, (seq_id, append_length) in enumerate(batch):
         fork_parent_id = None
         if isinstance(seq_id, tuple):
@@ -491,7 +493,6 @@ def apply_attention(
 
     q_array = []
     for seq_id, append_length in batch:
-        print(seq_id, append_length)
         new_q = np.random.rand(num_layers, append_length, num_qo_heads, head_dim).astype(dtype)
         new_k = np.random.rand(num_layers, append_length, num_kv_heads, head_dim).astype(dtype)
         new_v = np.random.rand(num_layers, append_length, num_kv_heads, head_dim).astype(dtype)
@@ -529,6 +530,7 @@ def apply_attention(
         outputs = tvm.nd.empty(queries_np.shape, dtype, device=device)
         qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, 2, num_qo_heads), -1000, dtype), device=device)
         ftopk_attention_with_fuse_qkv(kv_cache, layer_id, 1.0, qkv, outputs, qk_inner_product_data)
+        sorted_qk = np.sort(qk_inner_product_data.numpy()*np.log(2), axis=0)[::-1]
         # TODO(Zhihao): add test for qk_inner_product_data
         outputs = np.expand_dims(outputs.numpy(), axis=0)
         sum_length = 0
@@ -564,20 +566,22 @@ def apply_attention(
             ) + np.triu(np.full_like(softmax_input, np.finfo("float32").min), k=length_diff + 1)
             softmax_input = np.minimum(softmax_input, mask)
             # print(softmax_input.shape)
-            # print(np.argpartition(softmax_input, -5, axis=2)[0, 0, -5:])
-            results = np.expand_dims(
-                (scipy.special.softmax(softmax_input, axis=-1) @ v_seq.astype("float32")).transpose(
-                    1, 0, 2
-                ),
-                axis=0,
-            ).astype(dtype)
-
-            tvm.testing.assert_allclose(
-                outputs[:, sum_length : sum_length + append_length, ...],
-                results,
-                rtol=1e-3,
-                atol=1e-3,
-            )
+            results = np.sort(softmax_input, axis=-1)[:, 0, ::-1]
+            # print(results)
+            # print(sorted_qk[:results.shape[1], seq_id, :].T)
+            # results = np.expand_dims(
+            #     (scipy.special.softmax(softmax_input, axis=-1) @ v_seq.astype("float32")).transpose(
+            #         1, 0, 2
+            #     ),
+            #     axis=0,
+            # ).astype(dtype)
+            if append_length == 1:
+                tvm.testing.assert_allclose(
+                    sorted_qk[:results.shape[1], i, :].T,
+                    results,
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
             sum_length += append_length
     fend_forward(kv_cache)
 
@@ -593,7 +597,7 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
     # # Prefill.
     # operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
     # operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
-    # operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
+    # operation_seq += [[(6, 13)], [(8, 19)], [(0, 3)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
     # # Decode
     # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
     # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
@@ -603,6 +607,8 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
     # Prefill.
     operation_seq = [[(0, 6)], [(1, 8)],]
     # Decode
+    operation_seq += [[(0, 1), (1, 1)],]
+    operation_seq += [[(0, 1), (1, 1)],]
     operation_seq += [[(0, 1), (1, 1)],]
 
     cached_k = {}

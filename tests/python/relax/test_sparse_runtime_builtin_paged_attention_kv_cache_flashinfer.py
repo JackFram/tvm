@@ -30,6 +30,7 @@ from tvm.script import tir as T
 
 reserved_nseq = 32
 maximum_total_seq_length = 2048
+token_budget = 4
 prefill_chunk_size = 512
 page_size = 1
 num_layers = 4
@@ -460,6 +461,7 @@ def apply_attention(
 ) -> None:
     seq_ids = []
     append_lengths = []
+    top_k_indices = {}
     for i, (seq_id, append_length) in enumerate(batch):
         fork_parent_id = None
         if isinstance(seq_id, tuple):
@@ -483,7 +485,9 @@ def apply_attention(
             cached_k[seq_id] = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
             cached_v[seq_id] = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
 
+
     fbegin_forward(kv_cache, ShapeTuple(seq_ids), ShapeTuple(append_lengths))
+    # Here we want to plan both the full attention and the topk attention by using different handler
 
     global_new_q = np.zeros((num_layers, 0, num_qo_heads, head_dim), dtype)
     global_new_k = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
@@ -491,7 +495,7 @@ def apply_attention(
 
     q_array = []
     for seq_id, append_length in batch:
-        # print(seq_id, append_length)
+        print(seq_id, append_length)
         new_q = np.random.rand(num_layers, append_length, num_qo_heads, head_dim).astype(dtype)
         new_k = np.random.rand(num_layers, append_length, num_kv_heads, head_dim).astype(dtype)
         new_v = np.random.rand(num_layers, append_length, num_kv_heads, head_dim).astype(dtype)
@@ -520,6 +524,10 @@ def apply_attention(
         global_new_q = np.concatenate([global_new_q, new_q], axis=1)
         global_new_k = np.concatenate([global_new_k, new_k], axis=1)
         global_new_v = np.concatenate([global_new_v, new_v], axis=1)
+        if append_length == 1:
+            budget = min(cached_v[seq_id][0].shape[0], token_budget) 
+            top_k_indices[seq_id] = np.random.permutation(cached_v[seq_id][0].shape[0])[:budget]
+        
 
     for layer_id in range(num_layers):
         queries_np = global_new_q[layer_id]
@@ -544,12 +552,21 @@ def apply_attention(
                     rope_theta,
                 )
             ).transpose(1, 0, 2)
-            k_seq = (
-                cached_k[seq_id][layer_id]
+            if append_length == 1:
+                assert seq_id in top_k_indices, "seq_id should be in top_k_indices"
+                k_seq = (
+                cached_k[seq_id][layer_id][top_k_indices[seq_id]]
                 if rope_mode != RopeMode.INLINE
-                else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)
-            ).transpose(1, 2, 0)
-            v_seq = cached_v[seq_id][layer_id].transpose(1, 0, 2)
+                else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)[top_k_indices[seq_id]]
+                ).transpose(1, 2, 0)
+                v_seq = cached_v[seq_id][layer_id][top_k_indices[seq_id]].transpose(1, 0, 2)
+            else:
+                k_seq = (
+                    cached_k[seq_id][layer_id]
+                    if rope_mode != RopeMode.INLINE
+                    else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)
+                ).transpose(1, 2, 0)
+                v_seq = cached_v[seq_id][layer_id].transpose(1, 0, 2)
 
             k_seq = np.repeat(k_seq, num_qo_heads // num_kv_heads, axis=0)
             v_seq = np.repeat(v_seq, num_qo_heads // num_kv_heads, axis=0)
