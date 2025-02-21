@@ -38,6 +38,7 @@ from .tree_attn import (
     tree_attn_with_paged_kv_cache_cpu,
 )
 
+page_size = 1
 
 def _var_cpu(dtype):
     return T.alloc_buffer((1,), dtype)
@@ -413,7 +414,7 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
         bb = rx.BlockBuilder.current()
         mha_functions = (
             [
-                rx.Tuple([rx.StringImm("flashinfer"), rx.ExternFunc("batch_prefill_with_paged_kv_cache_run"), rx.ExternFunc("batch_prefill_with_kv_cache_plan")]),
+                rx.Tuple([rx.StringImm("flashinfer"), rx.ExternFunc("batch_prefill_with_paged_kv_cache_run"), rx.ExternFunc("topk_batch_prefill_with_paged_kv_cache_run"), rx.ExternFunc("batch_prefill_with_kv_cache_plan")]),
                 rx.Tuple([rx.StringImm("flashinfer"), rx.ExternFunc("batch_decode_with_paged_kv_cache_run"), rx.ExternFunc("batch_decode_with_paged_kv_cache_plan")]),
                 rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window")]),
                 rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window")]),
@@ -679,7 +680,7 @@ def _kv_cache_transpose_append(num_key_value_heads, head_dim, dtype):
         num_pages = T.int64()
         pages_elem_offset = T.int64()
         position_map_elem_offset = T.int32()
-        pages = T.match_buffer(var_pages, (num_pages, 2, num_key_value_heads, 16, head_dim), dtype, elem_offset=pages_elem_offset)
+        pages = T.match_buffer(var_pages, (num_pages, 2, num_key_value_heads, page_size, head_dim), dtype, elem_offset=pages_elem_offset)
         k_data = T.match_buffer(var_k_data, (ntoken, num_key_value_heads, head_dim), dtype)
         v_data = T.match_buffer(var_v_data, (ntoken, num_key_value_heads, head_dim), dtype)
         position_map = T.match_buffer(
@@ -690,15 +691,15 @@ def _kv_cache_transpose_append(num_key_value_heads, head_dim, dtype):
                 with T.block("k_transpose_append"):
                     vgpos, vh, vf = T.axis.remap("SSS", [global_pos, h, f])
                     T.reads(position_map[vgpos], k_data[vgpos, vh, vf])
-                    T.writes(pages[position_map[vgpos] // 16, 0, vh, position_map[vgpos] % 16, vf])
+                    T.writes(pages[position_map[vgpos] // page_size, 0, vh, position_map[vgpos] % page_size, vf])
                     position: T.int32 = position_map[vgpos]  # type: ignore
-                    pages[T.floordiv(position, 16), 0, vh, T.floormod(position, 16), vf] = k_data[vgpos, vh, vf]
+                    pages[T.floordiv(position, page_size), 0, vh, T.floormod(position, page_size), vf] = k_data[vgpos, vh, vf]
                 with T.block("v_transpose_append"):
                     vgpos, vh, vf = T.axis.remap("SSS", [global_pos, h, f])
                     T.reads(position_map[vgpos], v_data[vgpos, vh, vf])
-                    T.writes(pages[position_map[vgpos] // 16, 1, vh, position_map[vgpos] % 16, vf])
+                    T.writes(pages[position_map[vgpos] // page_size, 1, vh, position_map[vgpos] % page_size, vf])
                     position: T.int32 = position_map[vgpos] # type: ignore[name-defined,no-redef]
-                    pages[T.floordiv(position, 16), 1, vh, T.floormod(position, 16), vf] = v_data[vgpos, vh, vf]
+                    pages[T.floordiv(position, page_size), 1, vh, T.floormod(position, page_size), vf] = v_data[vgpos, vh, vf]
     # fmt: on
     # pylint: enable=line-too-long
 
@@ -721,7 +722,7 @@ def _kv_cache_transpose_append_mla(d_qk: int, dtype):
         num_pages = T.int64()
         pages_elem_offset = T.int64()
         position_map_elem_offset = T.int32()
-        pages = T.match_buffer(var_pages, (num_pages, 16, d_qk), dtype, elem_offset=pages_elem_offset)
+        pages = T.match_buffer(var_pages, (num_pages, page_size, d_qk), dtype, elem_offset=pages_elem_offset)
         kv_data = T.match_buffer(var_kv_data, (ntoken, d_qk), dtype)
         position_map = T.match_buffer(
             var_position_map, (ntoken,), "int32", elem_offset=position_map_elem_offset
@@ -731,9 +732,9 @@ def _kv_cache_transpose_append_mla(d_qk: int, dtype):
                 with T.block("k_transpose_append"):
                     vgpos, vf = T.axis.remap("SS", [global_pos, f])
                     T.reads(position_map[vgpos], kv_data[vgpos, vf])
-                    T.writes(pages[position_map[vgpos] // 16, position_map[vgpos] % 16, vf])
+                    T.writes(pages[position_map[vgpos] // page_size, position_map[vgpos] % page_size, vf])
                     position: T.int32 = position_map[vgpos]  # type: ignore
-                    pages[T.floordiv(position, 16), T.floormod(position, 16), vf] = kv_data[vgpos, vf]
+                    pages[T.floordiv(position, page_size), T.floormod(position, page_size), vf] = kv_data[vgpos, vf]
     # fmt: on
     # pylint: enable=line-too-long
 
@@ -924,7 +925,7 @@ def _attention_prefill_cpu(h_kv, h_q, d, dtype, sliding_window: bool, rope_scali
 
         q = T.match_buffer(var_q, (total_len, h_q, d), dtype)
         q_indptr = T.match_buffer(var_q_indptr, (batch_size + 1,), "int32", elem_offset=q_indptr_elem_offset)
-        pages = T.match_buffer(var_pages, (max_num_pages, 2, h_kv, 16, d), dtype)
+        pages = T.match_buffer(var_pages, (max_num_pages, 2, h_kv, page_size, d), dtype)
         page_indptr = T.match_buffer(var_page_indptr, (batch_size + 1,), "int32", elem_offset=page_indptr_elem_offset)
         page_values = T.match_buffer(var_page_values, (nnz_pages,), "int32", elem_offset=page_values_elem_offset)
         k_rope_pos_offset = T.match_buffer(var_k_rope_pos_offset, (batch_size,), "int32", elem_offset=k_rope_pos_offset_elem_offset)
@@ -960,10 +961,10 @@ def _attention_prefill_cpu(h_kv, h_q, d, dtype, sliding_window: bool, rope_scali
                     factor = T.alloc_buffer((1, ), "float32")
                     cur_page_indptr_begin: T.int32 = page_indptr[b_idx]
                     cur_page_indptr_end: T.int32 = page_indptr[b_idx + 1]
-                    #max_kv_len: T.int32 = max_num_pages * 16
+                    #max_kv_len: T.int32 = max_num_pages * page_size
                     kv_chunk_len[0] = T.if_then_else(
                         cur_page_indptr_begin != cur_page_indptr_end,
-                        _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, 16, b_idx, length_info, sliding_window),
+                        _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, page_size, b_idx, length_info, sliding_window),
                         0
                     )
 
@@ -983,12 +984,12 @@ def _attention_prefill_cpu(h_kv, h_q, d, dtype, sliding_window: bool, rope_scali
                                 _rope(q, q_rope_position[curl_q], d, rope_theta, rope_scale, (curl_q, h_qo, d_idx), dtype, rope_scaling),
                                 q[curl_q, h_qo, d_idx]
                             )
-                        for row_idx in T.serial(max_num_pages * 16):
+                        for row_idx in T.serial(max_num_pages * page_size):
                             if row_idx < kv_chunk_len[0]:
                                 # seq_offset: T.int32(is_size_var=True) = _get_seq_offset(row_idx, b_idx, length_info, sliding_window)
                                 #seq_offset: T.int32(is_size_var=True) = row_idx
-                                page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + (_get_seq_offset(row_idx, b_idx, length_info, sliding_window) // 16)]
-                                page_offset: T.int32(is_size_var=True) = _get_seq_offset(row_idx, b_idx, length_info, sliding_window) % 16
+                                page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + (_get_seq_offset(row_idx, b_idx, length_info, sliding_window) // page_size)]
+                                page_offset: T.int32(is_size_var=True) = _get_seq_offset(row_idx, b_idx, length_info, sliding_window) % page_size
 
                                 # Load KV
                                 for d_idx in T.serial(d):
@@ -1234,7 +1235,7 @@ def _attention_prefill(
 
         q = T.match_buffer(var_q, (total_len, h_q, d), dtype)
         q_indptr = T.match_buffer(var_q_indptr, (batch_size + 1,), "int32", elem_offset=q_indptr_elem_offset)
-        pages = T.match_buffer(var_pages, (max_num_pages, 2, h_kv, 16, d), dtype, elem_offset=pages_elem_offset)
+        pages = T.match_buffer(var_pages, (max_num_pages, 2, h_kv, page_size, d), dtype, elem_offset=pages_elem_offset)
         page_indptr = T.match_buffer(var_page_indptr, (batch_size + 1,), "int32", elem_offset=page_indptr_elem_offset)
         page_values = T.match_buffer(var_page_values, (nnz_pages,), "int32", elem_offset=page_values_elem_offset)
         k_rope_pos_offset = T.match_buffer(var_k_rope_pos_offset, (batch_size,), "int32", elem_offset=k_rope_pos_offset_elem_offset)
@@ -1307,7 +1308,7 @@ def _attention_prefill(
                                     cur_page_indptr_end: T.int32 = page_indptr[b_idx + 1]
                                     kv_chunk_len[0] = T.if_then_else(
                                         cur_page_indptr_begin != cur_page_indptr_end,
-                                        _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, 16, b_idx, length_info, sliding_window),
+                                        _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, page_size, b_idx, length_info, sliding_window),
                                         0
                                     )
                                     T.tvm_storage_sync("shared")
@@ -1353,8 +1354,8 @@ def _attention_prefill(
                                                 cur_L = L_kv_start + i
                                                 if cur_L < kv_chunk_len[0]:
                                                     seq_offset: T.int32(is_size_var=True) = _get_seq_offset(cur_L, b_idx, length_info, sliding_window)  # type: ignore
-                                                    page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, 16)]  # type: ignore
-                                                    page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, 16)  # type: ignore
+                                                    page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, page_size)]  # type: ignore
+                                                    page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, page_size)  # type: ignore
                                                     K_smem[i, j] = T.if_then_else(
                                                         rotary_mode == 1,
                                                         _rope(pages, k_rope_pos_offset[b_idx] + cur_L, d, rope_theta, rope_scale, (page_no, 0, by, page_offset, j), dtype, rope_scaling),
@@ -1371,8 +1372,8 @@ def _attention_prefill(
                                                 cur_L = L_kv_start + i
                                                 if cur_L < kv_chunk_len[0]:
                                                     seq_offset: T.int32(is_size_var=True) = _get_seq_offset(cur_L, b_idx, length_info, sliding_window)  # type: ignore
-                                                    page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, 16)]  # type: ignore
-                                                    page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, 16)  # type: ignore
+                                                    page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, page_size)]  # type: ignore
+                                                    page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, page_size)  # type: ignore
                                                     V_smem[i, j] = pages[page_no, 1, by, page_offset, j]
                                                 else:
                                                     V_smem[i, j] = 0.0
@@ -1520,7 +1521,7 @@ def _attention_decode_cpu(
         length_info_elem_offset = T.int32(is_size_var=True)
 
         Q = T.match_buffer(Q_handle, (B, H_qo, D), qkv_dtype)  # query 值
-        pages = T.match_buffer(pages_handle, (max_num_pages, 2, H_kv, 16, D), qkv_dtype)
+        pages = T.match_buffer(pages_handle, (max_num_pages, 2, H_kv, page_size, D), qkv_dtype)
         page_table_indptr = T.match_buffer(
             page_table_indptr_handle, (B + 1,), "int32", elem_offset=page_indptr_elem_offset
         )
@@ -1570,7 +1571,7 @@ def _attention_decode_cpu(
                     cur_page_indptr_begin != cur_page_indptr_end,
                     _get_kv_chunk_len(
                         cur_page_indptr_end - cur_page_indptr_begin,
-                        16,
+                        page_size,
                         b,
                         length_info,
                         sliding_window,
@@ -1606,9 +1607,9 @@ def _attention_decode_cpu(
                             row_idx, b, length_info, sliding_window
                         )
                         page_no: T.int32(is_size_var=True) = page_table_values[
-                            cur_page_indptr_begin + (seq_offset // 16)
+                            cur_page_indptr_begin + (seq_offset // page_size)
                         ]
-                        page_offset: T.int32(is_size_var=True) = seq_offset % 16
+                        page_offset: T.int32(is_size_var=True) = seq_offset % page_size
 
                         for d in T.serial(D):
                             K_local[d] = T.if_then_else(
@@ -1728,7 +1729,7 @@ def _attention_decode(
 
         Q = T.match_buffer(Q_handle, (B, H_qo, D), qkv_dtype)
         pages = T.match_buffer(
-            pages_handle, (max_num_pages, 2, H_kv, 16, D), qkv_dtype, elem_offset=pages_elem_offset
+            pages_handle, (max_num_pages, 2, H_kv, page_size, D), qkv_dtype, elem_offset=pages_elem_offset
         )
         page_table_indptr = T.match_buffer(page_table_indptr_handle, (B + 1,), "int32", elem_offset=page_indptr_elem_offset)
         page_table_values = T.match_buffer(page_table_values_handle, (nnz_pages,), "int32", elem_offset=page_values_elem_offset)
@@ -1782,7 +1783,7 @@ def _attention_decode(
                                 cur_page_indptr_end: T.int32 = page_table_indptr[batch_idx + 1]
                                 kv_chunk_len[0] = T.if_then_else(
                                     cur_page_indptr_begin != cur_page_indptr_end,
-                                    _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, 16, batch_idx, length_info, sliding_window),
+                                    _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, page_size, batch_idx, length_info, sliding_window),
                                     0
                                 )
 
@@ -1811,8 +1812,8 @@ def _attention_decode(
                                             row_g: T.int32(is_size_var=True) = tile_start_g + j  # type: ignore
                                             if row_g < kv_chunk_len[0]:
                                                 seq_offset: T.int32(is_size_var=True) = _get_seq_offset(row_g, batch_idx, length_info, sliding_window)  # type: ignore
-                                                page_no: T.int32(is_size_var=True) = page_table_values[cur_page_indptr_begin + T.floordiv(seq_offset, 16)]  # type: ignore
-                                                page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, 16)  # type: ignore
+                                                page_no: T.int32(is_size_var=True) = page_table_values[cur_page_indptr_begin + T.floordiv(seq_offset, page_size)]  # type: ignore
+                                                page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, page_size)  # type: ignore
                                                 for vec in T.vectorized(VEC_SIZE):
                                                     K_smem[tile_start_s + j, tx * VEC_SIZE + vec] = T.if_then_else(
                                                         rotary_mode == 1,
@@ -2756,7 +2757,7 @@ def _attention_prefill_mla(
 
         q = T.match_buffer(var_q, (total_len, h_q, d_qk), dtype)
         q_indptr = T.match_buffer(var_q_indptr, (batch_size + 1,), "int32", elem_offset=q_indptr_elem_offset)
-        pages = T.match_buffer(var_pages, (max_num_pages, 16, d_qk), dtype, elem_offset=pages_elem_offset)
+        pages = T.match_buffer(var_pages, (max_num_pages, page_size, d_qk), dtype, elem_offset=pages_elem_offset)
         page_indptr = T.match_buffer(var_page_indptr, (batch_size + 1,), "int32", elem_offset=page_indptr_elem_offset)
         page_values = T.match_buffer(var_page_values, (nnz_pages,), "int32", elem_offset=page_values_elem_offset)
         output = T.match_buffer(var_output, (total_len, h_q, d_latent), dtype)
@@ -2825,7 +2826,7 @@ def _attention_prefill_mla(
                                 cur_page_indptr_end: T.int32 = page_indptr[b_idx + 1]
                                 kv_chunk_len[0] = T.if_then_else(
                                     cur_page_indptr_begin != cur_page_indptr_end,
-                                    _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, 16, b_idx, length_info, sliding_window),
+                                    _get_kv_chunk_len(cur_page_indptr_end - cur_page_indptr_begin, page_size, b_idx, length_info, sliding_window),
                                     0
                                 )
                                 T.tvm_storage_sync("shared")
@@ -2867,8 +2868,8 @@ def _attention_prefill_mla(
                                             cur_L = L_kv_start + i
                                             if cur_L < kv_chunk_len[0]:
                                                 seq_offset: T.int32(is_size_var=True) = _get_seq_offset(cur_L, b_idx, length_info, sliding_window)  # type: ignore
-                                                page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, 16)]  # type: ignore
-                                                page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, 16)  # type: ignore
+                                                page_no: T.int32(is_size_var=True) = page_values[cur_page_indptr_begin + T.floordiv(seq_offset, page_size)]  # type: ignore
+                                                page_offset: T.int32(is_size_var=True) = T.floormod(seq_offset, page_size)  # type: ignore
                                                 KV_smem[i, j] = pages[page_no, page_offset, j]
                                             else:
                                                 KV_smem[i, j] = 0.0
@@ -3103,7 +3104,7 @@ def _compact_kv_copy(num_heads, head_dim, dtype, target: Target):
         copy_src_dst_pos_elem_offset = T.int32()
         pages_elem_offset = T.int64()
         pages = T.match_buffer(
-            var_pages, (num_pages, 2, num_heads, 16, head_dim), dtype, elem_offset=pages_elem_offset
+            var_pages, (num_pages, 2, num_heads, page_size, head_dim), dtype, elem_offset=pages_elem_offset
         )
         copy_length_indptr = T.match_buffer(
             var_copy_length_indptr,
@@ -3130,11 +3131,11 @@ def _compact_kv_copy(num_heads, head_dim, dtype, target: Target):
                         for i in T.serial(copy_length_indptr[b + 1] - copy_length_indptr[b]):
                             src_pos: T.int32 = copy_src_dst_pos[0, copy_length_indptr[b] + i]
                             dst_pos: T.int32 = copy_src_dst_pos[1, copy_length_indptr[b] + i]
-                            pages[dst_pos // 16, 0, h, dst_pos % 16, d] = pages[
-                                src_pos // 16, 0, h, src_pos % 16, d
+                            pages[dst_pos // page_size, 0, h, dst_pos % page_size, d] = pages[
+                                src_pos // page_size, 0, h, src_pos % page_size, d
                             ]
-                            pages[dst_pos // 16, 1, h, dst_pos % 16, d] = pages[
-                                src_pos // 16, 1, h, src_pos % 16, d
+                            pages[dst_pos // page_size, 1, h, dst_pos % page_size, d] = pages[
+                                src_pos // page_size, 1, h, src_pos % page_size, d
                             ]
 
     return compact_kv_copy
@@ -3155,7 +3156,7 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype):
         total_copy_length = T.int32()
         copy_length_indptr_elem_offset = T.int32()
         copy_src_dst_pos_elem_offset = T.int32()
-        pages = T.match_buffer(var_pages, (num_pages, 2, num_heads, 16, head_dim), dtype)
+        pages = T.match_buffer(var_pages, (num_pages, 2, num_heads, page_size, head_dim), dtype)
         copy_length_indptr = T.match_buffer(
             var_copy_length_indptr,
             (batch_size + 1,),
@@ -3179,11 +3180,11 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype):
                         for i in T.serial(copy_length_indptr[b + 1] - copy_length_indptr[b]):
                             src_pos: T.int32 = copy_src_dst_pos[0, copy_length_indptr[b] + i]
                             dst_pos: T.int32 = copy_src_dst_pos[1, copy_length_indptr[b] + i]
-                            pages[dst_pos // 16, 0, h, dst_pos % 16, d] = pages[
-                                src_pos // 16, 0, h, src_pos % 16, d
+                            pages[dst_pos // page_size, 0, h, dst_pos % page_size, d] = pages[
+                                src_pos // page_size, 0, h, src_pos % page_size, d
                             ]
-                            pages[dst_pos // 16, 1, h, dst_pos % 16, d] = pages[
-                                src_pos // 16, 1, h, src_pos % 16, d
+                            pages[dst_pos // page_size, 1, h, dst_pos % page_size, d] = pages[
+                                src_pos // page_size, 1, h, src_pos % page_size, d
                             ]
 
     return compact_kv_copy_cpu

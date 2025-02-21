@@ -72,6 +72,15 @@ class PagedPrefillFunc : public AttnBackendFunc {
     LOG(FATAL) << "MHA computation is not supported by the current backend";
   }
 
+  virtual void TopKMHA(int depth, NDArray q, NDArray qo_indptr, NDArray pages, NDArray page_indptr,
+                       NDArray page_indices, NDArray length_info, NDArray q_rope_position,
+                       NDArray k_rope_pos_offset, bool causal, RoPEMode rope_mode,
+                       double rotary_scale, double rotary_theta, double sm_scale,
+                       NDArray attn_output, NDArray qk_inner_product_data, NDArray attn_lse,
+                       TVMStreamHandle compute_stream) {
+    LOG(FATAL) << "MHA computation is not supported by the current backend";
+  }
+
   virtual void MLA(int depth, NDArray q, NDArray qo_indptr, NDArray pages, NDArray page_indptr,
                    NDArray page_indices, NDArray length_info, bool causal, double sm_scale,
                    NDArray attn_output, NDArray attn_lse, TVMStreamHandle compute_stream) {
@@ -133,6 +142,23 @@ class FlashInferPagedPrefillFunc : public PagedPrefillFunc {
     attn_func_(float_workspace_buffer, int_workspace_buffer, plan_info_vec, q, pages, qo_indptr,
                page_indptr, page_indices, length_info, q_rope_position, k_rope_pos_offset,
                attn_output, attn_lse, /*mask_mode_code=*/static_cast<int64_t>(causal),
+               /*pos_encoding_mode_code=*/static_cast<int64_t>(rope_mode == RoPEMode::kInline),
+               /*layout(HND)=*/1, /*window_left=*/-1, sm_scale, /*rope_rcp_scale=*/rope_rcp_scale,
+               /*rope_rcp_theta=*/rope_rcp_theta, compute_stream);
+  }
+
+  void TopKMHA(int depth, NDArray q, NDArray qo_indptr, NDArray pages, NDArray page_indptr,
+           NDArray page_indices, NDArray length_info, NDArray q_rope_position,
+           NDArray k_rope_pos_offset, bool causal, RoPEMode rope_mode, double rotary_scale,
+           double rotary_theta, double sm_scale, NDArray attn_output, NDArray qk_inner_product_data, NDArray attn_lse,
+           TVMStreamHandle compute_stream) final {
+    auto [float_workspace_buffer, int_workspace_buffer, page_locked_int_workspace_buffer,
+          plan_info_vec] = cached_buffers_[depth];
+    double rope_rcp_scale = 1 / rotary_scale;
+    double rope_rcp_theta = 1 / rotary_theta;
+    attn_func_(float_workspace_buffer, int_workspace_buffer, plan_info_vec, q, pages, qo_indptr,
+               page_indptr, page_indices, length_info, q_rope_position, k_rope_pos_offset,
+               attn_output, qk_inner_product_data, attn_lse, /*mask_mode_code=*/static_cast<int64_t>(causal),
                /*pos_encoding_mode_code=*/static_cast<int64_t>(rope_mode == RoPEMode::kInline),
                /*layout(HND)=*/1, /*window_left=*/-1, sm_scale, /*rope_rcp_scale=*/rope_rcp_scale,
                /*rope_rcp_theta=*/rope_rcp_theta, compute_stream);
