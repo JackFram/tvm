@@ -2042,9 +2042,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
               rope_mode_, kv_dtype_, kv_dtype_, copy_stream_);
         }
       } else {
-        if (f_attention_prefill_ != nullptr &&
-            f_attention_prefill_->backend_kind == AttnBackendKind::kFlashInfer) {
-          f_attention_prefill_->BeginForward(
+        if (f_attention_prefill_topk_ != nullptr &&
+            f_attention_prefill_topk_->backend_kind == AttnBackendKind::kFlashInfer) {
+          f_attention_prefill_topk_->BeginForward(
               d, temp_float_attn_workspace_, temp_int_attn_workspace_[d + 1],
               temp_int_pinned_attn_workspace_[d + 1], &qo_indptr_on_depths_host_[d],
               &page_indptr_on_depths_host_[d], &last_page_len_on_depths_host_[d],
@@ -2237,7 +2237,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     std::unique_ptr<PagedDecodeFunc>& f_decode =
         !support_sliding_window_ ? f_attention_decode_ : f_attention_decode_sliding_window_;
     CHECK_GE(num_depths_, 1) << "The number of effective depths must be greater or equal to 1.";
-
     bool cross_attn_computed = false;
     for (int d = 0; d < num_depths_; ++d) {
       if (page_indices_on_depths_view_[d]->shape[0] == 0) {

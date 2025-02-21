@@ -201,7 +201,8 @@ def create_kv_cache(rope_mode):
         ftranspose_append,
         None,  # f_transpose_append_mla
         ["flashinfer", fattention_prefill_ragged, fattention_prefill_ragged_plan],
-        ["flashinfer", fattention_prefill, fattention_prefill_topk, fattention_prefill_plan],
+        ["flashinfer", fattention_prefill, fattention_prefill_plan],
+        ["flashinfer", fattention_prefill_topk, fattention_prefill_plan],
         ["flashinfer", fattention_decode, fattention_decode_plan],
         [],  # fattn_prefill_sliding_window
         [],  # fattn_decode_sliding_window
@@ -288,6 +289,7 @@ def apply_attention(
             cached_v[seq_id] = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
 
     fbegin_forward(kv_cache, ShapeTuple(seq_ids), ShapeTuple(append_lengths))
+    # TODO(ZZ): Here we want to plan out both full attention and sparse attention
 
     global_new_q = np.zeros((num_layers, 0, num_qo_heads, head_dim), dtype)
     global_new_k = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
@@ -330,9 +332,10 @@ def apply_attention(
         values_np = global_new_v[layer_id]
         qkv = tvm.nd.array(np.concatenate([queries_np, keys_np, values_np], axis=1), device)
         outputs = tvm.nd.empty(queries_np.shape, dtype, device=device)
-        fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
-        qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, 2, num_qo_heads), -1000, dtype), device=device)
-        ftopk_attention_with_fuse_qkv(kv_cache, layer_id, 1.0, qkv, outputs, qk_inner_product_data)
+        # TODO(ZZ): Here depend on specific layers we will use different attention func calls
+        # fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
+        qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, 1, num_qo_heads), -1000, dtype), device=device)
+        ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
 
         # Compute attention expected results.
         outputs = np.expand_dims(outputs.numpy(), axis=0)
