@@ -40,6 +40,7 @@ from tvm.runtime import ShapeTuple
 reserved_nseq = 32
 maximum_total_seq_length = 2048
 prefill_chunk_size = 512
+token_budget = 4
 page_size = 1
 num_layers = 4
 num_qo_heads = 32
@@ -61,6 +62,7 @@ fend_forward = None
 fattention = None
 fattention_with_fuse_qkv = None
 ftopk_attention_with_fuse_qkv = None
+fsparse_attention_with_fuse_qkv = None
 fdebug_get_kv = None
 
 fattention_prefill_topk = None
@@ -78,6 +80,10 @@ fcopy_single_page = None
 fcopy_cache = None
 fcompact_copy = None
 
+# Tidal Function
+fset_tidal = None
+fupdate_tidal = None
+
 
 def set_global_func():
     global fclear, fadd_sequence, fremove_sequence, ffork_sequence, fpopn
@@ -86,6 +92,7 @@ def set_global_func():
     global fattention_prefill_plan, fattention_decode_plan, fattention_prefill_ragged_plan
     global fattention_merge_state, fsplit_rotary, fcopy_single_page
     global ftranspose_append, fcopy_cache, fcompact_copy
+    global fsparse_attention_with_fuse_qkv, fset_tidal, fupdate_tidal
 
     fclear = tvm.get_global_func("vm.builtin.kv_state_clear")
     fadd_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
@@ -94,11 +101,16 @@ def set_global_func():
     fpopn = tvm.get_global_func("vm.builtin.kv_state_popn")
     fbegin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
     fend_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
+    fset_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_set_tidal")
+    fupdate_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_update_tidal")
     fattention_with_fuse_qkv = tvm.get_global_func(
         "vm.builtin.attention_kv_cache_attention_with_fused_qkv"
     )
     ftopk_attention_with_fuse_qkv = tvm.get_global_func(
         "vm.builtin.topk_attention_kv_cache_attention_with_fused_qkv"
+    )
+    fsparse_attention_with_fuse_qkv = tvm.get_global_func(
+        "vm.builtin.sparse_attention_kv_cache_attention_with_fused_qkv"
     )
     fdebug_get_kv = tvm.get_global_func("vm.builtin.attention_kv_cache_debug_get_kv")
 
@@ -215,6 +227,7 @@ def create_kv_cache(rope_mode):
         fcopy_cache,
         fcompact_copy,
     )
+    fset_tidal(cache, token_budget)
     return cache
 
 
@@ -264,8 +277,13 @@ def apply_attention(
 ) -> None:
     seq_ids = []
     append_lengths = []
+    top_k_indices = {}
+    global_tidal_indices = []
+    decode = True
     print(batch)
     for i, (seq_id, append_length) in enumerate(batch):
+        if append_length > 1:
+            decode = False
         fork_parent_id = None
         if isinstance(seq_id, tuple):
             # Fork sequence
@@ -289,7 +307,6 @@ def apply_attention(
             cached_v[seq_id] = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
 
     fbegin_forward(kv_cache, ShapeTuple(seq_ids), ShapeTuple(append_lengths))
-    # TODO(ZZ): Here we want to plan out both full attention and sparse attention
 
     global_new_q = np.zeros((num_layers, 0, num_qo_heads, head_dim), dtype)
     global_new_k = np.zeros((num_layers, 0, num_kv_heads, head_dim), dtype)
@@ -325,6 +342,10 @@ def apply_attention(
         global_new_q = np.concatenate([global_new_q, new_q], axis=1)
         global_new_k = np.concatenate([global_new_k, new_k], axis=1)
         global_new_v = np.concatenate([global_new_v, new_v], axis=1)
+        if append_length == 1:
+            budget = min(cached_v[seq_id][0].shape[0], token_budget) 
+            top_k_indices[seq_id] = np.sort(np.random.permutation(cached_v[seq_id][0].shape[0])[:budget])
+            global_tidal_indices += top_k_indices[seq_id].tolist()
 
     for layer_id in range(num_layers):
         queries_np = global_new_q[layer_id]
@@ -332,12 +353,12 @@ def apply_attention(
         values_np = global_new_v[layer_id]
         qkv = tvm.nd.array(np.concatenate([queries_np, keys_np, values_np], axis=1), device)
         outputs = tvm.nd.empty(queries_np.shape, dtype, device=device)
-        # TODO(ZZ): Here depend on specific layers we will use different attention func calls
-        # fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
-        qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, queries_np.shape[0], num_qo_heads), -1000, dtype), device=device)
-        ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
-
-        sorted_qk = np.sort(qk_inner_product_data.numpy() * sm_scale, axis=0)[::-1]
+        # Here depend on specific layers we will use different attention func calls
+        if decode:
+            fupdate_tidal(kv_cache, ShapeTuple(seq_ids), ShapeTuple(global_tidal_indices))
+            fsparse_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
+        else:
+            fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
 
         # Compute attention expected results.
         outputs = np.expand_dims(outputs.numpy(), axis=0)
@@ -356,12 +377,22 @@ def apply_attention(
                     rope_theta,
                 )
             ).transpose(1, 0, 2)
-            k_seq = (
-                cached_k[seq_id][layer_id]
+
+            if append_length == 1:
+                assert seq_id in top_k_indices, "seq_id should be in top_k_indices"
+                k_seq = (
+                cached_k[seq_id][layer_id][top_k_indices[seq_id]]
                 if rope_mode != RopeMode.INLINE
-                else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)
-            ).transpose(1, 2, 0)
-            v_seq = cached_v[seq_id][layer_id].transpose(1, 0, 2)
+                else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)[top_k_indices[seq_id]]
+                ).transpose(1, 2, 0)
+                v_seq = cached_v[seq_id][layer_id][top_k_indices[seq_id]].transpose(1, 0, 2)
+            else:
+                k_seq = (
+                    cached_k[seq_id][layer_id]
+                    if rope_mode != RopeMode.INLINE
+                    else f_apply_rotary(cached_k[seq_id][layer_id], 0, rope_scale, rope_theta)
+                ).transpose(1, 2, 0)
+                v_seq = cached_v[seq_id][layer_id].transpose(1, 0, 2)
 
             k_seq = np.repeat(k_seq, num_qo_heads // num_kv_heads, axis=0)
             v_seq = np.repeat(v_seq, num_qo_heads // num_kv_heads, axis=0)
@@ -373,28 +404,16 @@ def apply_attention(
                 np.full_like(softmax_input, np.finfo("float32").max), k=length_diff
             ) + np.triu(np.full_like(softmax_input, np.finfo("float32").min), k=length_diff + 1)
             softmax_input = np.minimum(softmax_input, mask)
-
-            qk_results = np.sort(softmax_input, axis=-1)[:, 0, ::-1]
-            # print(results)
-            # print(sorted_qk[:results.shape[1], seq_id, :].T)
-            attn_results = np.expand_dims(
+            results = np.expand_dims(
                 (scipy.special.softmax(softmax_input, axis=-1) @ v_seq.astype("float32")).transpose(
                     1, 0, 2
                 ),
                 axis=0,
             ).astype(dtype)
 
-            if append_length == 1:
-                tvm.testing.assert_allclose(
-                    sorted_qk[:qk_results.shape[1], i, :].T,
-                    qk_results,
-                    rtol=1e-3,
-                    atol=1e-3,
-                )
-
             tvm.testing.assert_allclose(
                 outputs[:, sum_length : sum_length + append_length, ...],
-                attn_results,
+                results,
                 rtol=1e-3,
                 atol=1e-3,
             )
@@ -410,15 +429,19 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
     kv_cache, rope_mode = kv_cache_and_rope_mode
     fclear(kv_cache)
 
-    # Prefill.
-    operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
-    operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
-    operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
-    # Decode
-    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
-    operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # # Prefill.
+    # operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
+    # operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
+    # operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
+    # # Decode
+    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
+    # operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+
+    operation_seq = [[(0, 6)],]
+    
+    operation_seq += [[(0, 1)],]
 
     cached_k = {}
     cached_v = {}

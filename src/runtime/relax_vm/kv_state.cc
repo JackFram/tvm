@@ -76,6 +76,14 @@ TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_debug_get_kv")
     .set_body_method<AttentionKVCache>(&AttentionKVCacheObj::DebugGetKV);
 TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_debug_get_kv_mla")
     .set_body_method<AttentionKVCache>(&AttentionKVCacheObj::DebugGetKVMLA);
+TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_set_tidal")
+    .set_body_typed([](AttentionKVCache kv_cache, int64_t token_budget) {
+      kv_cache->SetTidal(token_budget);
+    });
+TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_update_tidal")
+    .set_body_typed([](AttentionKVCache kv_cache, IntTuple seq_ids, IntTuple append_lengths) {
+      kv_cache->UpdateTidalIndices(seq_ids, append_lengths);
+    });
 TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_with_fused_qkv")
     .set_body_typed([](AttentionKVCache kv_cache, int64_t layer_id, double sm_scale,
                        NDArray qkv_data, NDArray o_data) {
@@ -87,6 +95,12 @@ TVM_REGISTER_GLOBAL("vm.builtin.topk_attention_kv_cache_attention_with_fused_qkv
                        NDArray qkv_data, NDArray o_data, NDArray qk_inner_product_data) {
       kv_cache->TopKAttentionWithFusedQKV(layer_id, std::move(qkv_data), NullOpt, std::move(o_data),
                                             std::move(qk_inner_product_data), sm_scale);
+    });
+TVM_REGISTER_GLOBAL("vm.builtin.sparse_attention_kv_cache_attention_with_fused_qkv")
+    .set_body_typed([](AttentionKVCache kv_cache, int64_t layer_id, double sm_scale,
+                       NDArray qkv_data, NDArray o_data) {
+      kv_cache->SparseAttentionWithFusedQKV(layer_id, std::move(qkv_data), NullOpt, std::move(o_data),
+                                      sm_scale);
     });
 TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_self_attention")
     .set_body_typed([](AttentionKVCache kv_cache, int64_t layer_id, double sm_scale, NDArray q_data,

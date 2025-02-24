@@ -165,6 +165,12 @@ class AttentionKVCacheObj : public KVStateObj {
                               const IntTuple& compressed_remote_position_map,
                               int32_t recver_pe_offset) = 0;
 
+  /************** TidalAttention **************/
+  /*! \brief Setup tidal token budget */
+  virtual void SetTidal(int64_t token_budget) = 0;
+
+  /*! \brief update tidal topk indices */
+  virtual void UpdateTidalIndices(const IntTuple& seq_ids, const IntTuple& selected_kv_indices) = 0;
   /************** Attention **************/
 
   /*!
@@ -195,6 +201,21 @@ class AttentionKVCacheObj : public KVStateObj {
    */
   virtual void TopKAttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data, Optional<NDArray> mask,
                                      NDArray o_data, NDArray qk_inner_product_data, double sm_scale) = 0;
+  
+
+  /*!
+   * \brief Compute tidal style sparse attention with Q/K/V data which are concatenated along
+   * the head dimension.
+   * \param layer_id The model layer where the attention compute happens.
+   * \param qkv_data The input Q/K/V data, in layout
+   * `(total_length, num_qo_heads + 2 * num_kv_heads, head_dim)`.
+   * \param mask The input mask data, in layout `(total_sqr_length)`.
+   * \param o_data The output O data, in layout `(total_length, num_qo_heads, head_dim)`.
+   * \param sm_scale The additional attention scaling factor.
+   * \sa AttentionKVCache::Attention
+   */
+  virtual void SparseAttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data, Optional<NDArray> mask,
+    NDArray o_data, double sm_scale) = 0;
 
   /*!
    * \brief Fine-grained API that computes ragged self attention with Q/K/V data.
