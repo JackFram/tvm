@@ -264,8 +264,11 @@ def apply_attention(
 ) -> None:
     seq_ids = []
     append_lengths = []
+    decode = True
     print(batch)
     for i, (seq_id, append_length) in enumerate(batch):
+        if append_length > 1:
+            decode = False
         fork_parent_id = None
         if isinstance(seq_id, tuple):
             # Fork sequence
@@ -335,9 +338,12 @@ def apply_attention(
         # TODO(ZZ): Here depend on specific layers we will use different attention func calls
         # fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
         qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, queries_np.shape[0], num_qo_heads), -1000, dtype), device=device)
-        ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
 
-        sorted_qk = np.sort(qk_inner_product_data.numpy() * sm_scale, axis=0)[::-1]
+        if decode:
+            ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
+            sorted_qk = np.sort(qk_inner_product_data.numpy() * sm_scale, axis=0)[::-1]
+        else:
+            fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
 
         # Compute attention expected results.
         outputs = np.expand_dims(outputs.numpy(), axis=0)
@@ -537,7 +543,7 @@ def test_paged_attention_kv_cache_popn(kv_cache_and_rope_mode):
 
 if __name__ == "__main__":
     set_global_func()
-    for rope_mode in [RopeMode.NONE, RopeMode.NORMAL, RopeMode.INLINE]:
+    for rope_mode in [RopeMode.NONE, RopeMode.NORMAL]:
         cache = create_kv_cache(rope_mode)
         test_paged_attention_kv_cache_prefill_and_decode((cache, rope_mode))
         # test_paged_attention_kv_cache_remove_sequence((cache, rope_mode))

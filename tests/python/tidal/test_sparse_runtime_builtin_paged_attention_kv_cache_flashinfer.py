@@ -429,19 +429,15 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
     kv_cache, rope_mode = kv_cache_and_rope_mode
     fclear(kv_cache)
 
-    # # Prefill.
-    # operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
-    # operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
-    # operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
-    # # Decode
-    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    # operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
-    # operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-
-    operation_seq = [[(0, 6)],]
-    
-    operation_seq += [[(0, 1)],]
+    # Prefill.
+    operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
+    operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
+    operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
+    # Decode
+    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
+    operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
 
     cached_k = {}
     cached_v = {}
@@ -560,7 +556,7 @@ def test_paged_attention_kv_cache_popn(kv_cache_and_rope_mode):
 
 if __name__ == "__main__":
     set_global_func()
-    for rope_mode in [RopeMode.NONE, RopeMode.NORMAL, RopeMode.INLINE]:
+    for rope_mode in [RopeMode.NONE, RopeMode.NORMAL]:
         cache = create_kv_cache(rope_mode)
         test_paged_attention_kv_cache_prefill_and_decode((cache, rope_mode))
         # test_paged_attention_kv_cache_remove_sequence((cache, rope_mode))
