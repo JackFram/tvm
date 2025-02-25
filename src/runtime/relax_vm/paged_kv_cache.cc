@@ -870,10 +870,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                   << "\" cannot be found in KV cache.";
       int32_t block_idx = it->second.last_block_idx;
       const Block& block = global_block_pool_[block_idx];
-      LOG(INFO) << " batch_idx: " << i << " indptr range " << tidal_page_indptr_on_depths_host_[0][i] << " -> " << tidal_page_indptr_on_depths_host_[0][i+1];
       for (int j=tidal_page_indptr_on_depths_host_[0][i]; j<tidal_page_indptr_on_depths_host_[0][i+1]; ++j) {
-        tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[j]]);
-        LOG(INFO) << " selected indices: " << selected_kv_indices[j] << " -> " << block.page_ids[selected_kv_indices[j]];  
+        tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[j]]);  
       }
     }
   }
@@ -883,7 +881,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   void BeginForward(const IntTuple& seq_ids, const IntTuple& append_lengths,
                     const Optional<IntTuple>& opt_token_tree_parent_ptr) final {
     // Note: MLA does not supported tree attention for now.
-    // LOG(INFO) << "token_budget: " << token_budget_;
     if (attn_kinds_[0] == AttnKind::kMLA) {
       CHECK(!opt_token_tree_parent_ptr.defined()) << "Tree attention is not supported yet for MLA";
     }
@@ -2227,15 +2224,16 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
               static_cast<int64_t>(qo_indptr_on_depths_host_[d].size()) - 1,
               cur_append_lengths_indptr_host_.back(), page_size_, num_qo_heads_, num_kv_heads_,
               qk_head_dim_, v_head_dim_, /*causal=*/false, copy_stream_);
-          // tidal sparse attention plan, TODO(Zhihao): modify tidal attention begin forward param
-          // LOG(INFO) << "f_attention_prefill_->BeginForward.";
-          f_attention_prefill_->BeginForward(
-              d + 1, tidal_temp_float_attn_workspace_, tidal_temp_int_attn_workspace_[d + 1],
-              tidal_temp_int_pinned_attn_workspace_[d + 1], &qo_indptr_on_depths_host_[d],
-              &tidal_page_indptr_on_depths_host_[d], &last_page_len_on_depths_host_[d],
-              static_cast<int64_t>(qo_indptr_on_depths_host_[d].size()) - 1,
-              cur_append_lengths_indptr_host_.back(), page_size_, num_qo_heads_, num_kv_heads_,
-              qk_head_dim_, v_head_dim_, /*causal=*/false, copy_stream_);
+          // tidal sparse attention plan
+          if (token_budget_ > 0){
+            f_attention_prefill_->BeginForward(
+                d + 1, tidal_temp_float_attn_workspace_, tidal_temp_int_attn_workspace_[d + 1],
+                tidal_temp_int_pinned_attn_workspace_[d + 1], &qo_indptr_on_depths_host_[d],
+                &tidal_page_indptr_on_depths_host_[d], &last_page_len_on_depths_host_[d],
+                static_cast<int64_t>(qo_indptr_on_depths_host_[d].size()) - 1,
+                cur_append_lengths_indptr_host_.back(), page_size_, num_qo_heads_, num_kv_heads_,
+                qk_head_dim_, v_head_dim_, /*causal=*/false, copy_stream_);
+            }
         }
         if (f_attention_prefill_ != nullptr &&
             f_attention_prefill_->backend_kind == AttnBackendKind::kFlashInfer) {
@@ -2360,7 +2358,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     if (is_chain_on_depths_[0]) {
       // If the batch does not form a tree, use raggedness prefill kernel.
       ICHECK_NOTNULL(f_attention_prefill_ragged_);
-      // LOG(INFO) << "MHASelfAttnInternal - f_attention_prefill_ragged";
       f_attention_prefill_ragged_->MHA(
           q_data, k_data, v_data, cur_append_length_indptr_view_, cur_append_length_indptr_view_,
           q_rope_position_map_view_, k_ragged_rope_pos_offset_view_, /*causal=*/true, rope_mode_,
@@ -2430,7 +2427,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
-        LOG(INFO) << "MHACrossAttnInternal - f_prefill";
         ICHECK_NOTNULL(f_prefill);
         f_prefill->MHA(d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                        page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
@@ -2491,7 +2487,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
-        // LOG(INFO) << "TopKMHACrossAttnInternal - f_prefill";
         ICHECK_NOTNULL(f_prefill);
         f_prefill->TopKMHA(d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                            page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
@@ -2552,7 +2547,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
-        LOG(INFO) << "Sparse MHACrossAttnInternal - f_prefill";
         ICHECK_NOTNULL(f_prefill);
         CHECK_EQ(d, 0) << "Sparse attention only supports num_depth_ = 1.";
         CHECK_GE(token_budget_, 1) << "Token budget must be greater than or equal to 1.";
@@ -2677,7 +2671,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       page_indices_on_depths_view_[d] =
           aux_data_manager_->CopyPageIndicesOnDepthAsync(&page_indices_on_depths_host_[d], d);
       if (token_budget_ > 0 && is_decode_request_) {
-        LOG(INFO) << "num_sequences: " << num_sequences << "total_append_length: " << total_append_length;
         ICHECK_EQ(tidal_page_indices_on_depths_host_[d].size(), tidal_page_indptr_on_depths_host_[d].back());
         tidal_page_indices_on_depths_view_[d] =
             aux_data_manager_->CopyPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[d], d);
