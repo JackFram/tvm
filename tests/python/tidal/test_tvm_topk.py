@@ -25,6 +25,12 @@ def main():
 
     device = tvm.cuda()
     target = tvm.target.Target.from_device(device)
+    # Enable thrust for CUDA
+    target_dict = dict(target.export())
+    target_dict["libs"] = (
+        (target_dict["libs"] + ["thrust"]) if "libs" in target_dict else ["thrust"]
+    )
+    target = tvm.target.Target(target_dict)
     executable = relax.build(
         mod, target="cuda", pipeline=relax.backend.cuda.get_default_pipeline(target)
     )

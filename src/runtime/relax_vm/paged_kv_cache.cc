@@ -184,6 +184,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   std::vector<bool> use_decode_kernel_;
   /*! \brief Whether the attention request is a decode request, set in BeginForwardFunction. */
   bool is_decode_request_;
+  /*! \brief Whether update tidal indices. */
+  bool update_tidal_indices_;
   /*! \brief The KV transfer recver disco group's PE offset in this forward.
              If no KV is transfered, recver is -1.
              Assume that all the KV are transfered to the same recver in the forward.
@@ -450,6 +452,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             NDArray::Empty({kIntAttnWorkspaceByte}, DataType::UInt(8), device));
         tidal_temp_int_pinned_attn_workspace_.push_back(NDArray::Empty(
             {kIntAttnWorkspaceByte}, DataType::UInt(8), GetPreferredHostDevice(device)));
+        tidal_temp_int_attn_workspace_.push_back(
+            NDArray::Empty({kIntAttnWorkspaceByte}, DataType::UInt(8), device));
+        tidal_temp_int_pinned_attn_workspace_.push_back(NDArray::Empty(
+            {kIntAttnWorkspaceByte}, DataType::UInt(8), GetPreferredHostDevice(device)));
       }
       qo_indptr_on_depths_view_.push_back(NDArray());
       page_indptr_on_depths_view_.push_back(NDArray());
@@ -471,10 +477,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       temp_float_attn_workspace_ =
           NDArray::Empty({kFloatAttnWorkspaceByte}, DataType::UInt(8), device);
 
-      tidal_temp_int_attn_workspace_.push_back(
-          NDArray::Empty({kIntAttnWorkspaceByte}, DataType::UInt(8), device));
-      tidal_temp_int_pinned_attn_workspace_.push_back(NDArray::Empty(
-          {kIntAttnWorkspaceByte}, DataType::UInt(8), GetPreferredHostDevice(device)));
       tidal_temp_float_attn_workspace_ =
           NDArray::Empty({kFloatAttnWorkspaceByte}, DataType::UInt(8), device);
     }
@@ -859,8 +861,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
   /************** Update Tidal Indices **************/
   void UpdateTidalIndices(const IntTuple& seq_ids, const IntTuple& selected_kv_indices) final {
-    // selected_kv_indices is a 1D array of compacted indices, that can be indexed by tidal_page_indptr_on_depths_host_. 
-    CHECK_GE(token_budget_, 0) << "The token budget must be set (>0) before updating tidal indices.";
+    // selected_kv_indices is a 1D array of compacted indices, that can be indexed by
+    // tidal_page_indptr_on_depths_host_.
+    CHECK_GE(token_budget_, 0)
+        << "The token budget must be set (>0) before updating tidal indices.";
     CHECK(is_decode_request_) << "The update of tidal indices is only allowed in decode request.";
     HostMemoryVector& tidal_page_indices_h = tidal_page_indices_on_depths_host_[0];
     tidal_page_indices_h.clear();
@@ -870,10 +874,23 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                   << "\" cannot be found in KV cache.";
       int32_t block_idx = it->second.last_block_idx;
       const Block& block = global_block_pool_[block_idx];
-      for (int j=tidal_page_indptr_on_depths_host_[0][i]; j<tidal_page_indptr_on_depths_host_[0][i+1]; ++j) {
-        tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[j]]);  
+      for (int j = 0; j < tidal_page_indptr_on_depths_host_[0][i + 1]-tidal_page_indptr_on_depths_host_[0][i]; ++j) {
+        tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[i*token_budget_+j]]);
+        // LOG(INFO) << "Tidal page indices: " << block.page_ids[selected_kv_indices[i*token_budget_+j]];
       }
     }
+
+    // // Better but has bug
+    // ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
+    //           tidal_page_indptr_on_depths_host_[0].back());
+    // tidal_page_indices_on_depths_view_[0] =
+    //     aux_data_manager_->CopyTDPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[0], 0);
+    // // - Sync two streams.
+    // DeviceAPI::Get(device_)->SyncStreamFromTo(device_, copy_stream_, compute_stream_);
+    
+    // Opt(Zhihao): remove this in future optimizations
+    dirty_aux_data_device_ = true;
+    update_tidal_indices_ = true;
   }
 
   /************** Attention **************/
@@ -896,6 +913,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     std::vector<Sequence*> sequences;
     std::vector<int32_t> last_block_length_before_append;
     is_decode_request_ = true;
+    update_tidal_indices_ = false;
     sequences.reserve(cur_batch_size_);
     last_block_length_before_append.reserve(cur_batch_size_);
     k_ragged_rope_pos_offset_host_.clear();
@@ -2198,6 +2216,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             v_head_dim_, /*causal=*/true, copy_stream_);
       }
     }
+    LOG(INFO) << " is_decode_request: " << is_decode_request_ << " num_depth: " << num_depths_;
     for (int d = 0; d < num_depths_; ++d) {
       if (page_indices_on_depths_view_[d]->shape[0] == 0) {
         continue;
@@ -2215,25 +2234,26 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       } else {
         if (is_decode_request_ && f_attention_prefill_topk_ != nullptr &&
             f_attention_prefill_topk_->backend_kind == AttnBackendKind::kFlashInfer) {
-          CHECK_EQ(d, 0) << "TopK attention only supports num_depth_ = 1.";
+          // CHECK_EQ(d, 0) << "TopK attention only supports num_depth_ = 1.";
           // tidal topk attention plan
           f_attention_prefill_topk_->BeginForward(
-              d, tidal_temp_float_attn_workspace_, tidal_temp_int_attn_workspace_[d],
-              tidal_temp_int_pinned_attn_workspace_[d], &qo_indptr_on_depths_host_[d],
+              d, tidal_temp_float_attn_workspace_, tidal_temp_int_attn_workspace_[2 * d],
+              tidal_temp_int_pinned_attn_workspace_[2 * d], &qo_indptr_on_depths_host_[d],
               &page_indptr_on_depths_host_[d], &last_page_len_on_depths_host_[d],
               static_cast<int64_t>(qo_indptr_on_depths_host_[d].size()) - 1,
               cur_append_lengths_indptr_host_.back(), page_size_, num_qo_heads_, num_kv_heads_,
               qk_head_dim_, v_head_dim_, /*causal=*/false, copy_stream_);
           // tidal sparse attention plan
-          if (token_budget_ > 0){
+          if (token_budget_ > 0 && is_decode_request_) {
             f_attention_prefill_->BeginForward(
-                d + 1, tidal_temp_float_attn_workspace_, tidal_temp_int_attn_workspace_[d + 1],
-                tidal_temp_int_pinned_attn_workspace_[d + 1], &qo_indptr_on_depths_host_[d],
+                num_depths_, tidal_temp_float_attn_workspace_,
+                tidal_temp_int_attn_workspace_[2 * d + 1],
+                tidal_temp_int_pinned_attn_workspace_[2 * d + 1], &qo_indptr_on_depths_host_[d],
                 &tidal_page_indptr_on_depths_host_[d], &last_page_len_on_depths_host_[d],
                 static_cast<int64_t>(qo_indptr_on_depths_host_[d].size()) - 1,
                 cur_append_lengths_indptr_host_.back(), page_size_, num_qo_heads_, num_kv_heads_,
                 qk_head_dim_, v_head_dim_, /*causal=*/false, copy_stream_);
-            }
+          }
         }
         if (f_attention_prefill_ != nullptr &&
             f_attention_prefill_->backend_kind == AttnBackendKind::kFlashInfer) {
@@ -2427,6 +2447,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
+        LOG(INFO) << "MHACrossAttnInternal: Use prefill kernel for depth d";
         ICHECK_NOTNULL(f_prefill);
         f_prefill->MHA(d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                        page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
@@ -2550,7 +2571,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         ICHECK_NOTNULL(f_prefill);
         CHECK_EQ(d, 0) << "Sparse attention only supports num_depth_ = 1.";
         CHECK_GE(token_budget_, 1) << "Token budget must be greater than or equal to 1.";
-        f_prefill->MHA(d + 1, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
+        ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
+                  tidal_page_indptr_on_depths_host_[0].back())
+            << "tidal_page_indices_on_depths_host_ size mismatch.";
+        f_prefill->MHA(num_depths_, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                        tidal_page_indptr_on_depths_view_[d], tidal_page_indices_on_depths_view_[d],
                        length_info_on_depths_view_[d], q_rope_position_map_view_,
                        k_rope_pos_offset_view_[d], /*causal=*/false,
@@ -2659,7 +2683,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       ICHECK_EQ(page_indptr_on_depths_host_[d].size(), qo_indptr_on_depths_host_[d].size());
       page_indptr_on_depths_view_[d] =
           aux_data_manager_->CopyPageIndptrOnDepthAsync(&page_indptr_on_depths_host_[d], d);
-      if(token_budget_ > 0 && is_decode_request_) {
+      if (token_budget_ > 0 && is_decode_request_) {
         ICHECK_EQ(tidal_page_indptr_on_depths_host_[d].size(), qo_indptr_on_depths_host_[d].size());
         tidal_page_indptr_on_depths_view_[d] =
             aux_data_manager_->CopyPageIndptrOnDepthAsync(&tidal_page_indptr_on_depths_host_[d], d);
@@ -2670,12 +2694,20 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       ICHECK_EQ(page_indices_on_depths_host_[d].size(), page_indptr_on_depths_host_[d].back());
       page_indices_on_depths_view_[d] =
           aux_data_manager_->CopyPageIndicesOnDepthAsync(&page_indices_on_depths_host_[d], d);
-      if (token_budget_ > 0 && is_decode_request_) {
-        ICHECK_EQ(tidal_page_indices_on_depths_host_[d].size(), tidal_page_indptr_on_depths_host_[d].back());
-        tidal_page_indices_on_depths_view_[d] =
-            aux_data_manager_->CopyPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[d], d);
-      }
     }
+    // Tidal Page indices update
+    // Opt(Zhihao): This is a temporary solution to update indices, we don't need to replan the
+    // kernel
+
+    if (token_budget_ > 0 && is_decode_request_ && update_tidal_indices_) {
+      ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
+                tidal_page_indptr_on_depths_host_[0].back());
+      tidal_page_indices_on_depths_view_[0] =
+          aux_data_manager_->CopyPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[0],
+          0);
+      update_tidal_indices_ = false;
+    }
+
     // 5. length_info_on_depths
     // last_page_len_on_depths_host_;
     // sliding_window_offset_on_depths_host_;

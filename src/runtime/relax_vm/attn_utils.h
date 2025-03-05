@@ -432,6 +432,8 @@ class PagedKVCacheAuxDataManager {
   virtual NDArray CopyPageIndptrOnDepthAsync(HostMemoryVector* data, int depth) = 0;
   /*! \brief Copy the indices array of page table. */
   virtual NDArray CopyPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) = 0;
+  /*! \brief Copy the indices array of page table. */
+  virtual NDArray CopyTDPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) = 0;
   /*! \brief Copy the array of KV slot number used in the last page of the seq. */
   virtual NDArray CopyLastPageLenOnDepthAsync(HostMemoryVector* data, int depth) = 0;
   /*!
@@ -568,6 +570,12 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     CopyVecDataToArray(view, data->data());
     return view;
   }
+  NDArray CopyTDPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) final {
+    NDArray view = page_indices_on_depths_device_[depth].CreateView(
+        {static_cast<int64_t>(data->size())}, dtype_aux_);
+    CopyVecDataToArray(view, data->data());
+    return view;
+  }
   NDArray CopyLastPageLenOnDepthAsync(HostMemoryVector* data, int depth) final {
     NDArray view = length_info_on_depths_device_[depth].CreateView(
         {static_cast<int64_t>(data->size())}, dtype_aux_);
@@ -634,7 +642,6 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     CopyVecDataToArray(view, data->data());
     return view;
   }
-
   NDArray CopyTreeAttnMaskOnDepthAsync(HostMemoryVector* data, int depth) final {
     NDArray view =
         tree_attn_mask_device_[depth].CreateView({static_cast<int64_t>(data->size())}, dtype_aux_);
@@ -647,7 +654,6 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     CopyVecDataToArray(view, data->data());
     return view;
   }
-
   NDArray CopyLengthInfoOnDepthAsync(HostMemoryVector* last_page_len,
                                      HostMemoryVector* sliding_window_offset,
                                      HostMemoryVector* sink_size, int depth) final {
@@ -778,6 +784,8 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     int64_t attn_aux_data_cache_size =
         CalculateAttnAuxDataCacheSize(reserved_num_seqs, num_total_pages, prefill_chunk_size);
     // - Initialize the host auxiliary data buffer.
+    tidal_page_indices_copy_offset_ = attn_aux_data_cache_size - kPagedKVCacheMaxBlockDepth * 
+        CeilDivElemAlignment(num_total_pages);
     merged_attn_aux_data_host_ =
         HostMemoryVector(attn_aux_data_cache_size, dtype_aux, preferred_host_device);
     // - Initialize the device auxiliary data buffer.
@@ -803,6 +811,33 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   }
   NDArray CopyPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) final {
     return CopyAttnAuxVecToCache(data);
+  }
+  NDArray CopyTDPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) final {
+    int64_t n_elem = data->size();
+    // LOG(INFO) << " page_offset: " << tidal_page_indices_copy_offset_ << " n_elem: " << n_elem
+    //           << " elem_byte_size: " << elem_byte_size_;
+    std::memcpy(merged_attn_aux_data_host_.data() + tidal_page_indices_copy_offset_, data->data(),
+                n_elem * elem_byte_size_);
+    NDArray view = merged_attn_aux_data_device_.CreateView(
+        {n_elem}, dtype_aux_, tidal_page_indices_copy_offset_ * elem_byte_size_);
+
+    std::vector<int64_t> copy_shape{CeilDivElemAlignment(n_elem)};
+    DLTensor copy_dst;
+    copy_dst.data = merged_attn_aux_data_device_->data;
+    copy_dst.device = device_;
+    copy_dst.ndim = 1;
+    copy_dst.dtype = dtype_aux_;
+    copy_dst.shape = copy_shape.data();
+    copy_dst.strides = nullptr;
+    copy_dst.byte_offset = tidal_page_indices_copy_offset_;
+
+    DLTensor copy_src = copy_dst;
+    copy_src.data = merged_attn_aux_data_host_.data();
+    copy_src.device = Device{kDLCPU, 0};
+    copy_src.byte_offset = tidal_page_indices_copy_offset_;
+    NDArray::CopyFromTo(&copy_src, &copy_dst, copy_stream_);
+
+    return view;
   }
   NDArray CopyLastPageLenOnDepthAsync(HostMemoryVector* data, int depth) final {
     return CopyAttnAuxVecToCache(data);
@@ -923,9 +958,13 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     //  - qo_indptr_in_depth
     //  - page_indptr_in_depth
     //  - page_indices_in_depth
+    //  - tidal_page_indptr_in_depth
     //  - length_info_in_depth
     //  - k_rope_pos_offset_in_depth
+    //  - tidal_page_indices_in_depth
     cache_size += CeilDivElemAlignment(reserved_num_seqs + 1);
+    cache_size += CeilDivElemAlignment(reserved_num_seqs + 1);
+    cache_size += CeilDivElemAlignment(num_total_pages);
     cache_size += CeilDivElemAlignment(reserved_num_seqs + 1);
     cache_size += CeilDivElemAlignment(num_total_pages);
     cache_size += CeilDivElemAlignment(3 * reserved_num_seqs);
@@ -1008,6 +1047,7 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   const int64_t offset_alignment_;
 
   int64_t attn_aux_data_copy_offset_ = 0;
+  int64_t tidal_page_indices_copy_offset_ = 0;
   int64_t compact_kv_aux_data_copy_offset_ = 0;
   HostMemoryVector merged_attn_aux_data_host_;
   HostMemoryVector merged_compact_kv_aux_data_host_;
