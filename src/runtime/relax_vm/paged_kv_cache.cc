@@ -2216,7 +2216,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             v_head_dim_, /*causal=*/true, copy_stream_);
       }
     }
-    LOG(INFO) << " is_decode_request: " << is_decode_request_ << " num_depth: " << num_depths_;
+    // LOG(INFO) << " is_decode_request: " << is_decode_request_ << " num_depth: " << num_depths_;
     for (int d = 0; d < num_depths_; ++d) {
       if (page_indices_on_depths_view_[d]->shape[0] == 0) {
         continue;
@@ -2447,7 +2447,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
-        LOG(INFO) << "MHACrossAttnInternal: Use prefill kernel for depth d";
+        // LOG(INFO) << "MHACrossAttnInternal: Use prefill kernel for depth d";
         ICHECK_NOTNULL(f_prefill);
         f_prefill->MHA(d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                        page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
