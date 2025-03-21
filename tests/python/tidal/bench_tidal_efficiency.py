@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import scipy.special
 import nvtx
+import argparse
 
 import tvm
 import tvm.testing
@@ -40,12 +41,12 @@ from tvm.runtime import ShapeTuple
 from tvm import relax, te, tir
 
 reserved_nseq = 1
-maximum_total_seq_length = 12000
-prefill_chunk_size = 10240
+maximum_total_seq_length = 12800 * 8
+prefill_chunk_size = 12800 * 8
 token_budget = 512
-tidal_layer_indices = [2, 13]
+tidal_layer_indices = [2,]
 page_size = 1
-num_layers = 32
+num_layers = 8
 num_qo_heads = 32
 num_kv_heads = 8
 head_dim = 128
@@ -54,9 +55,6 @@ rope_scale = 1.0
 rope_theta = 1e4
 dtype = "float16"
 device = tvm.cuda()
-
-prompt_len = 10240
-decode_len = 16
 
 fclear = None
 fadd_sequence = None
@@ -308,6 +306,9 @@ def apply_attention(
     batch: List[Tuple[Union[int, Tuple[int, int, int]], int]],
     cached_k: Dict[int, np.ndarray],
     cached_v: Dict[int, np.ndarray],
+    prompt_len: int,
+    decode_len: int,
+    batch_size: int,
 ) -> None:
     seq_ids = []
     append_lengths = []
@@ -391,11 +392,13 @@ def apply_attention(
             elif layer_id in tidal_layer_indices:
                 # Token re-selection layers
                 with nvtx.annotate("qk-inner-product-attention"):
-                    qk_inner_product_data = tvm.nd.array(np.full((maximum_total_seq_length, queries_np.shape[0], num_qo_heads), -1000, dtype), device=device)
+                    qk_len = max(prompt_len+decode_len, token_budget)
+                    qk_inner_product_data = tvm.nd.array(np.full((qk_len, queries_np.shape[0], num_qo_heads), -1000, dtype), device=device)
                     ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
                 with nvtx.annotate("topk"):
                     _, top_k_indices = fargtopk(qk_inner_product_data) # Shape (token_budget, batch_size, num_qo_heads)
-                    global_tidal_indices = top_k_indices.numpy()[:, :, 0].T.flatten().tolist() # Temporarily use the first head
+                    top_k_indices = np.argsort(qk_inner_product_data.numpy(), axis=0)[-token_budget:]
+                    global_tidal_indices = top_k_indices[:, :, 0].T.flatten().tolist() # Temporarily use the first head
                 with nvtx.annotate("update-topk-indices"):
                     fupdate_tidal(kv_cache, ShapeTuple(seq_ids), ShapeTuple(global_tidal_indices))
             else:
@@ -410,7 +413,7 @@ def apply_attention(
     fend_forward(kv_cache)
 
 
-def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
+def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode, prompt_len=512, decode_len=8, batch_size=1):
     kv_cache, rope_mode = kv_cache_and_rope_mode
     fclear(kv_cache)
 
@@ -424,22 +427,29 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode):
     # operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
     # operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
 
+    print(f"prompt_len: {prompt_len}, decode_len: {decode_len}, batch_size: {batch_size}")
+
     # Prefill.
-    operation_seq = [[(0, prompt_len)], ]
+    operation_seq = [[(i, prompt_len) for i in range(batch_size)], ]
     # Decode
-    operation_seq += [[(0, 1)]] * decode_len
+    operation_seq += [[(i, 1) for i in range(batch_size)], ] * decode_len
 
     cached_k = {}
     cached_v = {}
     for batch in operation_seq:
-        apply_attention(kv_cache, rope_mode, batch, cached_k, cached_v)
+        apply_attention(kv_cache, rope_mode, batch, cached_k, cached_v, prompt_len=prompt_len, decode_len=decode_len, batch_size=batch_size)
 
 
 if __name__ == "__main__":
     set_global_func()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--prompt-len", type=int, default=512)
+    parser.add_argument("-d", "--decode-len", type=int, default=8)
+    parser.add_argument("-b", "--batch-size", type=int, default=1)
+    args = parser.parse_args()
+    prompt_len = args.prompt_len
+    decode_len = args.decode_len
+    batch_size = args.batch_size
     for rope_mode in [RopeMode.NONE, RopeMode.NORMAL]:
         cache = create_kv_cache(rope_mode)
-        test_paged_attention_kv_cache_prefill_and_decode((cache, rope_mode))
-        # test_paged_attention_kv_cache_remove_sequence((cache, rope_mode))
-        # test_paged_attention_kv_cache_fork_sequence((cache, rope_mode))
-        # test_paged_attention_kv_cache_popn((cache, rope_mode))
+        test_paged_attention_kv_cache_prefill_and_decode((cache, rope_mode), prompt_len=prompt_len, decode_len=decode_len, batch_size=batch_size)
