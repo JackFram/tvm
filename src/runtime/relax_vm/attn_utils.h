@@ -54,12 +54,13 @@ enum class AttnKind : int {
   kMHA = 0,
   kMLA = 1,
   kLinearAttn = 2,
+  kTidal = 3,
 };
 
 /*! \brief Given the attention kind and other metadata, return the one-layer KV cache shape. */
 inline ShapeTuple GetKVCacheShape(AttnKind attn_kind, int64_t num_total_pages, int num_sequence,
                                   int64_t num_kv_heads, int64_t page_size, int64_t qk_head_dim,
-                                  int64_t v_head_dim) {
+                                  int64_t v_head_dim, int64_t token_budget, bool offload_tidal) {
   if (attn_kind == AttnKind::kMHA) {
     // Ignore v_head_dim since multi-head attention requires K/V to have the same head dim.
     return {num_total_pages, 2, num_kv_heads, page_size, qk_head_dim};
@@ -67,9 +68,26 @@ inline ShapeTuple GetKVCacheShape(AttnKind attn_kind, int64_t num_total_pages, i
     return {num_total_pages, page_size, qk_head_dim};
   } else if (attn_kind == AttnKind::kLinearAttn) {
     return {num_sequence, num_kv_heads, qk_head_dim, v_head_dim};
+  } else if (attn_kind == AttnKind::kTidal) {
+    int64_t num_pages = offload_tidal ? num_sequence * token_budget : num_total_pages;
+    return {num_pages, 2, num_kv_heads, page_size, qk_head_dim};
   }
   ICHECK(false);
   return ShapeTuple();
+}
+
+/*! \brief Given the attention kind and other metadata, return the one-layer KV cache shape. */
+inline ShapeTuple GetTDKVCacheShape(AttnKind attn_kind, int64_t num_total_pages, int num_sequence,
+  int64_t num_kv_heads, int64_t page_size, int64_t qk_head_dim,
+  int64_t v_head_dim, int64_t token_budget) {
+if (attn_kind == AttnKind::kMHA) {
+  // Ignore v_head_dim since multi-head attention requires K/V to have the same head dim.
+  return {};
+} else if (attn_kind == AttnKind::kTidal) {
+  return {num_total_pages, 2, num_kv_heads, page_size, qk_head_dim};
+}
+ICHECK(false);
+return ShapeTuple();
 }
 
 /*!
@@ -976,7 +994,8 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     //  - cur_append_length_indptr
     //  - k_ragged_rope_pos_offset
     //  - q_rope_position_map
-    //  - append_position_map
+    //  - append_position_map * 2
+    //  - sparse_decode_append_position_map
     //  - kv_transfer_remote_position_map
     //  - kv_transfer_recver_id
     //  - kv_transfer_page_to_page_local_position_map
@@ -987,7 +1006,8 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     cache_size += CeilDivElemAlignment(reserved_num_seqs + 1);
     cache_size += CeilDivElemAlignment(reserved_num_seqs);
     cache_size += CeilDivElemAlignment(prefill_chunk_size);
-    cache_size += CeilDivElemAlignment(prefill_chunk_size);
+    cache_size += CeilDivElemAlignment(prefill_chunk_size) * 3;
+    // cache_size += CeilDivElemAlignment(reserved_num_seqs);
     cache_size += CeilDivElemAlignment(prefill_chunk_size);
     cache_size += CeilDivElemAlignment(prefill_chunk_size);
     cache_size += CeilDivElemAlignment(prefill_chunk_size);
@@ -1054,6 +1074,159 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   NDArray merged_attn_aux_data_device_;
   NDArray merged_compact_kv_aux_data_device_;
 };
+
+
+/*!
+ * \brief The class of host memory int32 vector in "std::vector" interface.
+ * This vector allocates static memory on the specified host memory
+ * at the time of construction.
+ */
+class HostKVVector {
+  public:
+   HostKVVector() = default;
+   HostKVVector(const HostKVVector&) = delete;
+   HostKVVector(HostKVVector&& other) = default;
+   HostKVVector& operator=(const HostKVVector&) = delete;
+   HostKVVector& operator=(HostKVVector&& other) = default;
+ 
+   explicit HostKVVector(int64_t reserved_size, DLDataType dtype, Device device)
+       : reserved_size_(reserved_size) {
+     ICHECK(DataType(dtype) == DataType::Float(16));
+     data_ = NDArray::Empty({reserved_size}, dtype, device);
+   }
+ 
+   const int16_t& operator[](int64_t idx) const {
+     ICHECK_GE(idx, 0) << "Index " << idx << " is negative.";
+     ICHECK_LT(idx, current_size_) << "Index " << idx << " out of bounds " << current_size_;
+     return static_cast<int16_t*>(data_->data)[idx];
+   }
+ 
+   int16_t back() const {
+     ICHECK_GT(current_size_, 0) << "Vector is empty";
+     return static_cast<int16_t*>(data_->data)[current_size_ - 1];
+   }
+ 
+   size_t size() const { return static_cast<size_t>(current_size_); }
+ 
+   int16_t* data() const { return static_cast<int16_t*>(data_->data); }
+ 
+   void clear() { current_size_ = 0; }
+ 
+   /*! \brief Return the vector as an NDArray. */
+   NDArray as_ndarray() { return data_.CreateView({current_size_}, data_->dtype); }
+ 
+   IntTuple as_int_tuple() const {
+     std::vector<int64_t> values;
+     values.reserve(current_size_);
+     for (int i = 0; i < current_size_; ++i) {
+       values.push_back(static_cast<int16_t*>(data_->data)[i]);
+     }
+     return IntTuple(values);
+   }
+ 
+  private:
+   int64_t reserved_size_ = 0;
+   int64_t current_size_ = 0;
+   NDArray data_{nullptr};
+ };
+ 
+
+
+/*!
+ * \brief The offloading kv cache manager class for TidalInference.
+ * It allocates a large on-device array to store all the auxiliary data.
+ * For each `CopyXXXAsync`, it copies the input data to a local cache on host.
+ * In `CommitAttnAuxDataCopy`, it copies all the data in the local cache to the device
+ * array for a single time, and thus reduce the number of host-to-device copies needed.
+ */
+class TidalKVCacheManager{
+  public:
+   explicit TidalKVCacheManager(int64_t reserved_num_seqs, int64_t token_budget, DLDataType dtype_kv,
+                                  int64_t num_kv_heads, int64_t page_size, int64_t qk_head_dim,
+                                             Device device, Device preferred_host_device)
+       : dtype_kv_(dtype_kv), 
+         device_(device),
+         preferred_host_device_(preferred_host_device),
+         elem_byte_size_((dtype_kv.bits * dtype_kv.lanes + 7) / 8),
+         offset_alignment_(cuda_byte_alignment_ / elem_byte_size_),
+         token_budget_(token_budget) {
+     // - Calculate cache size of all the attention auxiliary arrays in
+     // local cache and the large on-device array.
+     stride_page_ = CeilDivElemAlignment(page_size * qk_head_dim * 2 * num_kv_heads);
+     int64_t attn_kv_cache_size =
+         CalculateCompactKVCacheSize(reserved_num_seqs, page_size, num_kv_heads, qk_head_dim);
+
+     // TODO(Zhihao): add double buffer here
+     merged_kv_cache_data_host_ =
+         HostKVVector(attn_kv_cache_size, dtype_kv, preferred_host_device);
+   }
+
+   /*!
+   * \brief Copy the input data to the cache at the given offset.
+   * And return the NDArray view of the cache starting at the offset.
+   */
+    void CopyPageH2H(NDArray kv_data_host, int64_t page_id) {
+      int64_t n_elem = stride_page_;
+      void* dst = merged_kv_cache_data_host_.data() + attn_kv_cache_copy_offset_;
+      const void* src = static_cast<int16_t*>(kv_data_host->data) + page_id * stride_page_;
+      std::memcpy(dst, src, n_elem * elem_byte_size_);
+      attn_kv_cache_copy_offset_ += CeilDivElemAlignment(n_elem);
+    }
+
+    void CommitCompactKVCacheH2DCopy(NDArray merged_kv_cache_data_device, TVMStreamHandle copy_stream) {
+      std::vector<int64_t> copy_shape{attn_kv_cache_copy_offset_};
+      DLTensor copy_dst;
+      copy_dst.data = merged_kv_cache_data_device->data;
+      copy_dst.device = device_;
+      copy_dst.ndim = 1;
+      copy_dst.dtype = dtype_kv_;
+      copy_dst.shape = copy_shape.data();
+      copy_dst.strides = nullptr;
+      copy_dst.byte_offset = 0;
+  
+      DLTensor copy_src = copy_dst;
+      copy_src.data = merged_kv_cache_data_host_.data();
+      copy_src.device = Device{kDLCPU, 0};
+      NDArray::CopyFromTo(&copy_src, &copy_dst, copy_stream);
+    }
+
+    void ResetCompactKVCacheDataCopy() { attn_kv_cache_copy_offset_ = 0; }
+ 
+   private:
+    /*! \brief The dtype of the kv data. It is expected to be float16. */
+    const DLDataType dtype_kv_;
+    /*! \brief The device this PagedKVCache runs on. */
+    const Device device_;
+    /*! \brief The preferred host device. */
+    const Device preferred_host_device_;
+
+    /*!
+   * \brief Calculate the start element offsets of the auxiliary arrays in the local cache.
+   * \return Return the local cache size (total number of elements in the local cache).
+   */
+  int64_t CalculateCompactKVCacheSize(int64_t reserved_num_seqs, int64_t page_size,
+    int64_t num_kv_head, int64_t qk_head_dim) {
+      int64_t cache_size = 0;
+      // allocate continuous chunk of memory on pinned memory for kv cache data transfer [num_seqs * token_budget, 2, num_kv_head, page_size, qk_head_dim]
+      cache_size += CeilDivElemAlignment(reserved_num_seqs * 2 * page_size * token_budget_ * num_kv_head * qk_head_dim);
+      return cache_size;
+  }
+
+  /*! \brief For safety, we align the start offset of the arrays to `offset_alignment`. */
+  int64_t CeilDivElemAlignment(int n) {
+    return (n + offset_alignment_ - 1) / offset_alignment_ * offset_alignment_;
+  }
+
+  const int64_t cuda_byte_alignment_ = 16;
+  const int64_t elem_byte_size_;
+  const int64_t offset_alignment_;
+  const int64_t token_budget_;
+  int64_t stride_page_;
+
+  int64_t attn_kv_cache_copy_offset_ = 0;
+  HostKVVector merged_kv_cache_data_host_;
+   
+ };
 
 }  // namespace relax_vm
 }  // namespace runtime

@@ -87,6 +87,8 @@ class AttnKind(enum.IntEnum):
 
     MHA = 0
     MLA = 1
+    LinearAttn = 2
+    Tidal = 3
 
 
 class RopeMode(enum.IntEnum):

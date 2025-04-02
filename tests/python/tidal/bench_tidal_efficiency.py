@@ -40,10 +40,12 @@ from tvm.relax.frontend.nn.llm.kv_cache import (
 from tvm.runtime import ShapeTuple
 from tvm import relax, te, tir
 
-reserved_nseq = 1
+reserved_nseq = 8
 maximum_total_seq_length = 12800 * 8
 prefill_chunk_size = 12800 * 8
 token_budget = 512
+num_sink_token = 4
+num_window_token = 32
 tidal_layer_indices = [2,]
 page_size = 1
 num_layers = 8
@@ -85,7 +87,6 @@ fcopy_cache = None
 fcompact_copy = None
 
 # Tidal Function
-fset_tidal = None
 fupdate_tidal = None
 fargtopk = None
 
@@ -119,7 +120,6 @@ def set_global_func():
     fpopn = tvm.get_global_func("vm.builtin.kv_state_popn")
     fbegin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
     fend_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
-    fset_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_set_tidal")
     fupdate_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_update_tidal")
     fattention_with_fuse_qkv = tvm.get_global_func(
         "vm.builtin.attention_kv_cache_attention_with_fused_qkv"
@@ -227,6 +227,10 @@ def create_kv_cache(rope_mode):
                 prefill_chunk_size,
                 page_size,
                 support_sliding_window,
+                token_budget,
+                num_sink_token,
+                num_window_token,
+                True, # enable_tidal_offload
             ]
         ),
         tvm.runtime.ShapeTuple([0, num_layers]),
@@ -234,7 +238,7 @@ def create_kv_cache(rope_mode):
         num_kv_heads,
         head_dim,
         head_dim,  # v_head_dim
-        tvm.runtime.ShapeTuple([int(AttnKind.MHA) for _ in range(num_layers)]),
+        tvm.runtime.ShapeTuple([int(AttnKind.MHA) if (i < tidal_layer_indices[0] or i in tidal_layer_indices) else int(AttnKind.Tidal) for i in range(num_layers)]),
         False,  # enable_kv_transfer
         rope_mode,
         rope_scale,
@@ -258,8 +262,6 @@ def create_kv_cache(rope_mode):
         fcopy_cache,
         fcompact_copy,
     )
-    with nvtx.annotate("setup tidal decode token budget"):
-        fset_tidal(cache, token_budget)
     return cache
 
 
@@ -396,8 +398,15 @@ def apply_attention(
                     qk_inner_product_data = tvm.nd.array(np.full((qk_len, queries_np.shape[0], num_qo_heads), -1000, dtype), device=device)
                     ftopk_attention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs, qk_inner_product_data)
                 with nvtx.annotate("topk"):
-                    _, top_k_indices = fargtopk(qk_inner_product_data) # Shape (token_budget, batch_size, num_qo_heads)
-                    top_k_indices = np.argsort(qk_inner_product_data.numpy(), axis=0)[-token_budget:]
+                    # _, top_k_indices = fargtopk(qk_inner_product_data) # Shape (token_budget, batch_size, num_qo_heads)
+                    assert token_budget >= num_sink_token + num_window_token, "token_budget should be larger than num_sink_token + num_window_token"
+                    
+                    # TODO(Zhihao): use right slice indices
+                    middle_tokens = qk_inner_product_data.numpy()
+                    middle_tokens[:num_sink_token, :, :] = -1000
+                    for seq_id in seq_ids:
+                        middle_tokens[cached_k[seq_id].shape[1]-num_window_token:, seq_id, :] = -1000
+                    top_k_indices = np.argsort(middle_tokens, axis=0)[-(token_budget-num_sink_token-num_window_token):][::-1]
                     global_tidal_indices = top_k_indices[:, :, 0].T.flatten().tolist() # Temporarily use the first head
                 with nvtx.annotate("update-topk-indices"):
                     fupdate_tidal(kv_cache, ShapeTuple(seq_ids), ShapeTuple(global_tidal_indices))
@@ -443,7 +452,7 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode, pro
 if __name__ == "__main__":
     set_global_func()
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--prompt-len", type=int, default=512)
+    parser.add_argument("-p", "--prompt-len", type=int, default=16)
     parser.add_argument("-d", "--decode-len", type=int, default=8)
     parser.add_argument("-b", "--batch-size", type=int, default=1)
     args = parser.parse_args()

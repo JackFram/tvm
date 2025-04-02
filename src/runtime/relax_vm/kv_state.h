@@ -165,10 +165,6 @@ class AttentionKVCacheObj : public KVStateObj {
                               const IntTuple& compressed_remote_position_map,
                               int32_t recver_pe_offset) = 0;
 
-  /************** TidalAttention **************/
-  /*! \brief Setup tidal token budget */
-  virtual void SetTidal(int64_t token_budget) = 0;
-
   /*! \brief update tidal topk indices */
   virtual void UpdateTidalIndices(const IntTuple& seq_ids, const IntTuple& selected_kv_indices) = 0;
   /************** Attention **************/

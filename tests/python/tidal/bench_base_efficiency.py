@@ -41,7 +41,7 @@ from tvm import relax, te, tir
 
 import argparse
 
-reserved_nseq = 1
+reserved_nseq = 8
 maximum_total_seq_length = 12800 * 8
 prefill_chunk_size = 12800 * 8
 token_budget = 512
@@ -86,7 +86,6 @@ fcopy_cache = None
 fcompact_copy = None
 
 # Tidal Function
-fset_tidal = None
 fupdate_tidal = None
 fargtopk = None
 
@@ -111,7 +110,7 @@ def set_global_func():
     global fattention_prefill_plan, fattention_decode_plan, fattention_prefill_ragged_plan
     global fattention_merge_state, fsplit_rotary, fcopy_single_page
     global ftranspose_append, fcopy_cache, fcompact_copy
-    global fsparse_attention_with_fuse_qkv, fset_tidal, fupdate_tidal, fargtopk
+    global fsparse_attention_with_fuse_qkv, fupdate_tidal, fargtopk
 
     fclear = tvm.get_global_func("vm.builtin.kv_state_clear")
     fadd_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
@@ -120,7 +119,7 @@ def set_global_func():
     fpopn = tvm.get_global_func("vm.builtin.kv_state_popn")
     fbegin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
     fend_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
-    fset_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_set_tidal")
+    # fset_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_set_tidal")
     fupdate_tidal = tvm.get_global_func("vm.builtin.attention_kv_cache_attention_update_tidal")
     fattention_with_fuse_qkv = tvm.get_global_func(
         "vm.builtin.attention_kv_cache_attention_with_fused_qkv"
@@ -228,6 +227,8 @@ def create_kv_cache(rope_mode):
                 prefill_chunk_size,
                 page_size,
                 support_sliding_window,
+                token_budget,
+                False, # enable_tidal offload
             ]
         ),
         tvm.runtime.ShapeTuple([0, num_layers]),
@@ -259,8 +260,8 @@ def create_kv_cache(rope_mode):
         fcopy_cache,
         fcompact_copy,
     )
-    with nvtx.annotate("setup tidal decode token budget"):
-        fset_tidal(cache, token_budget)
+    # with nvtx.annotate("setup tidal decode token budget"):
+    #     fset_tidal(cache, token_budget)
     return cache
 
 
@@ -423,9 +424,9 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_rope_mode, pro
 if __name__ == "__main__":
     set_global_func()
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--prompt-len", type=int, default=512)
+    parser.add_argument("-p", "--prompt-len", type=int, default=16)
     parser.add_argument("-d", "--decode-len", type=int, default=8)
-    parser.add_argument("-b", "--batch-size", type=int, default=1)
+    parser.add_argument("-b", "--batch-size", type=int, default=2)
     args = parser.parse_args()
     prompt_len = args.prompt_len
     decode_len = args.decode_len

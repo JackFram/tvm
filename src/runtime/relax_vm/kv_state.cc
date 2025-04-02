@@ -76,10 +76,6 @@ TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_debug_get_kv")
     .set_body_method<AttentionKVCache>(&AttentionKVCacheObj::DebugGetKV);
 TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_debug_get_kv_mla")
     .set_body_method<AttentionKVCache>(&AttentionKVCacheObj::DebugGetKVMLA);
-TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_set_tidal")
-    .set_body_typed([](AttentionKVCache kv_cache, int64_t token_budget) {
-      kv_cache->SetTidal(token_budget);
-    });
 TVM_REGISTER_GLOBAL("vm.builtin.attention_kv_cache_attention_update_tidal")
     .set_body_typed([](AttentionKVCache kv_cache, IntTuple seq_ids, IntTuple append_lengths) {
       kv_cache->UpdateTidalIndices(seq_ids, append_lengths);

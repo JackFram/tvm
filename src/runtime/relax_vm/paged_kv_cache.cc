@@ -119,8 +119,24 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   const DLDataType dtype_aux_ = DLDataType(DataType::Int(32, 1));
 
   /********************* For Tidal *********************/
+  /*!
+   * \brief The Host KV data managed by the KV cache.
+   * If KV transfer function is specifed, pages_ will be allocated by NVSHMEM as a whole NDArray.
+   * pages_ will contain tensor view of each layer.
+   * Otherwise, pages_ has `num_layers` NDArrays, each of them
+   * has layout (num_pages, 2, num_heads, page_size, qk_head_dim).
+   * Along on the "2" dimension, index 0 stands for K and 1 stands for V.
+   */
+  std::vector<NDArray> tmp_device_pages_;
+  std::vector<NDArray> host_pages_;
   /*! \brief The supposed token budget for Tidal. */
   int64_t token_budget_;
+  int64_t num_sink_tokens_;
+  int64_t num_window_tokens_;
+  int64_t sparse_layer_start_idx_;
+  int64_t reserved_num_seqs_;
+  int64_t num_tidal_tokens_;
+  bool tidal_offload_;
   // temp metadata For TidalInference
   std::vector<NDArray> tidal_temp_int_attn_workspace_;
   std::vector<NDArray> tidal_temp_int_pinned_attn_workspace_;
@@ -130,6 +146,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   std::vector<NDArray> tidal_qo_indptr_on_depths_view_;
   std::vector<NDArray> tidal_page_indptr_on_depths_view_;
   std::vector<NDArray> tidal_page_indices_on_depths_view_;
+  std::unique_ptr<TidalKVCacheManager> tidal_kv_data_manager_;
+  std::vector<int64_t> prefill_window_offset_host_;
 
   /********************* Page Structures *********************/
 
@@ -220,6 +238,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   HostMemoryVector k_ragged_rope_pos_offset_host_;
   HostMemoryVector q_rope_position_map_host_;
   HostMemoryVector append_position_map_host_;
+  HostMemoryVector sink_window_append_position_map_host_;
+  HostMemoryVector sparse_decode_append_position_map_host_;
   HostMemoryVector cur_append_lengths_indptr_host_;
   std::vector<HostMemoryVector> tree_attn_mask_host_;
   std::vector<HostMemoryVector> tree_attn_mn_indptr_host_;
@@ -243,6 +263,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   NDArray k_ragged_rope_pos_offset_view_;
   NDArray q_rope_position_map_view_;
   NDArray append_position_map_view_;
+  NDArray sink_window_append_position_map_view_;
+  NDArray sparse_decode_append_position_map_view_;
   NDArray kv_transfer_remote_position_map_view_;
   NDArray kv_transfer_recver_id_view_;
   NDArray kv_transfer_page_to_page_local_position_map_view_;
@@ -292,7 +314,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   explicit PagedAttentionKVCacheObj(
       int64_t page_size, int64_t num_layers, int64_t layer_id_begin_offset,
       int64_t layer_id_end_offset, int64_t num_qo_heads, int64_t num_kv_heads, int64_t qk_head_dim,
-      int64_t v_head_dim, std::vector<AttnKind> attn_kinds, int64_t reserved_num_seqs,
+      int64_t v_head_dim, std::vector<AttnKind> attn_kinds, int64_t reserved_num_seqs, 
+      int64_t tidal_token_budget, int64_t num_sink_tokens, int64_t num_window_tokens, bool tidal_offload,
       int64_t num_total_pages, int64_t prefill_chunk_size, bool support_sliding_window,
       RoPEMode rope_mode, double rotary_scale, double rotary_theta,
       Optional<NDArray> rope_ext_factors, bool enable_kv_transfer, DLDataType dtype, Device device,
@@ -325,6 +348,11 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         rotary_theta_(rotary_theta),
         rope_ext_factors_(std::move(rope_ext_factors)),
         kv_dtype_(DataType(dtype)),
+        token_budget_(tidal_token_budget),
+        num_sink_tokens_(num_sink_tokens),
+        num_window_tokens_(num_window_tokens),
+        reserved_num_seqs_(reserved_num_seqs),
+        tidal_offload_(tidal_offload),
         f_transpose_append_mha_(std::move(f_transpose_append_mha)),
         f_transpose_append_mla_(std::move(f_transpose_append_mla)),
         f_compact_copy_(std::move(f_compact_copy)),
@@ -348,10 +376,16 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       CHECK(!support_sliding_window_) << "Sliding window not supported yet for MLA";
       CHECK(!enable_kv_transfer) << "KV transfer not supported yet for MLA";
     }
-
-    token_budget_ = -1;
-
     pages_.reserve(num_layers);
+    host_pages_.reserve(num_layers);
+    tmp_device_pages_.reserve(1);
+    sparse_layer_start_idx_ = -1;
+    num_tidal_tokens_ = token_budget_ - num_sink_tokens_ - num_window_tokens_;
+    prefill_window_offset_host_.clear();
+
+    CHECK_GE(num_tidal_tokens_, 0)
+        << "The token budget should be larger than the number of sink tokens and window tokens.";
+
     if (enable_kv_transfer) {
       // For now, KV transfer only supports MHA.
       for (AttnKind attn_kind : attn_kinds_) {
@@ -380,10 +414,32 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       f_transfer_kv_page_to_page_ = *f_transfer_kv_page_to_page_ptr;
     } else {
       for (int i = 0; i < num_layers; ++i) {
+        if(!tidal_offload_){
+          ShapeTuple kv_cache_shape =
+              GetKVCacheShape(AttnKind::kMHA, num_total_pages,
+                              reserved_num_seqs, num_kv_heads, page_size, qk_head_dim, v_head_dim, tidal_token_budget, tidal_offload);
+          pages_.push_back(NDArray::Empty(kv_cache_shape, dtype, device));
+          // LOG(INFO) << "layer_id: " << i << "kv_cache_shape: " << kv_cache_shape << "device: " << device;
+        }
+        else{
+          ShapeTuple kv_cache_shape =
+              GetKVCacheShape(attn_kinds_[layer_id_begin_offset_ + i], num_total_pages,
+                              reserved_num_seqs, num_kv_heads, page_size, qk_head_dim, v_head_dim, tidal_token_budget, tidal_offload);
+          pages_.push_back(NDArray::Empty(kv_cache_shape, dtype, device));
+          // LOG(INFO) << " device_kv_cache_shape: " << kv_cache_shape << " device: " << device;
+
+          ShapeTuple offload_kv_cache_shape =
+              GetTDKVCacheShape(attn_kinds_[layer_id_begin_offset_ + i], num_total_pages,
+                              reserved_num_seqs, num_kv_heads, page_size, qk_head_dim, v_head_dim, tidal_token_budget);
+          host_pages_.push_back(NDArray::Empty(offload_kv_cache_shape, dtype, GetPreferredHostDevice(device)));
+          // LOG(INFO) << " offload_kv_cache_shape: " << offload_kv_cache_shape << " device: " << GetPreferredHostDevice(device);
+        }
+      }
+      if(tidal_offload){
         ShapeTuple kv_cache_shape =
-            GetKVCacheShape(attn_kinds_[layer_id_begin_offset_ + i], num_total_pages,
-                            reserved_num_seqs, num_kv_heads, page_size, qk_head_dim, v_head_dim);
-        pages_.push_back(NDArray::Empty(kv_cache_shape, dtype, device));
+              GetKVCacheShape(AttnKind::kMHA, num_total_pages,
+                              reserved_num_seqs, num_kv_heads, page_size, qk_head_dim, v_head_dim, tidal_token_budget, tidal_offload);
+        tmp_device_pages_.push_back(NDArray::Empty(kv_cache_shape, dtype, device));
       }
     }
 
@@ -421,6 +477,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         HostMemoryVector(prefill_chunk_size, dtype_aux_, preferred_host_device);
     append_position_map_host_ =
         HostMemoryVector(prefill_chunk_size, dtype_aux_, preferred_host_device);
+    sink_window_append_position_map_host_ =
+        HostMemoryVector(prefill_chunk_size, dtype_aux_, preferred_host_device);
+    sparse_decode_append_position_map_host_ =
+        HostMemoryVector(reserved_num_seqs, dtype_aux_, preferred_host_device);
     kv_transfer_remote_position_map_host_ =
         HostMemoryVector(prefill_chunk_size, dtype_aux_, preferred_host_device);
     kv_transfer_recver_id_host_ =
@@ -517,7 +577,11 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       aux_data_manager_ = std::make_unique<CachedPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
           preferred_host_device, copy_stream_);
+      tidal_kv_data_manager_ = std::make_unique<TidalKVCacheManager>(
+          reserved_num_seqs, num_tidal_tokens_, kv_dtype_, num_kv_heads, page_size, qk_head_dim,
+          device, preferred_host_device);
     } else {
+      CHECK(!tidal_offload_);
       aux_data_manager_ = std::make_unique<PlainPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
           preferred_host_device, copy_stream_);
@@ -551,9 +615,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     free_block_idx_.clear();
     dirty_aux_data_device_ = false;
   }
-
-  /************** Setup Tidal **************/
-  void SetTidal(int64_t token_budget) final { token_budget_ = token_budget; }
 
   /************** Sequence Management **************/
 
@@ -866,31 +927,66 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     CHECK_GE(token_budget_, 0)
         << "The token budget must be set (>0) before updating tidal indices.";
     CHECK(is_decode_request_) << "The update of tidal indices is only allowed in decode request.";
-    HostMemoryVector& tidal_page_indices_h = tidal_page_indices_on_depths_host_[0];
-    tidal_page_indices_h.clear();
-    for (int i = 0; i < cur_batch_size_; ++i) {
-      auto it = seq_map_.find(seq_ids[i]);
-      CHECK(it != seq_map_.end()) << "The sequence \"" << seq_ids[i]
-                                  << "\" cannot be found in KV cache.";
-      int32_t block_idx = it->second.last_block_idx;
-      const Block& block = global_block_pool_[block_idx];
-      for (int j = 0; j < tidal_page_indptr_on_depths_host_[0][i + 1]-tidal_page_indptr_on_depths_host_[0][i]; ++j) {
-        tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[i*token_budget_+j]]);
-        // LOG(INFO) << "Tidal page indices: " << block.page_ids[selected_kv_indices[i*token_budget_+j]];
+    if(!tidal_offload_){
+      HostMemoryVector& tidal_page_indices_h = tidal_page_indices_on_depths_host_[0];
+      tidal_page_indices_h.clear();
+      for (int i = 0; i < cur_batch_size_; ++i) {
+        auto it = seq_map_.find(seq_ids[i]);
+        CHECK(it != seq_map_.end()) << "The sequence \"" << seq_ids[i]
+                                    << "\" cannot be found in KV cache.";
+        int32_t block_idx = it->second.last_block_idx;
+        const Block& block = global_block_pool_[block_idx];
+        for (int j = 0; j < tidal_page_indptr_on_depths_host_[0][i + 1]-tidal_page_indptr_on_depths_host_[0][i]; ++j) {
+          tidal_page_indices_h.push_back(block.page_ids[selected_kv_indices[i*token_budget_+j]]);
+          // LOG(INFO) << "Tidal page indices: " << block.page_ids[selected_kv_indices[i*token_budget_+j]];
+        }
+      }
+  
+      // // Better but has bug
+      // ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
+      //           tidal_page_indptr_on_depths_host_[0].back());
+      // tidal_page_indices_on_depths_view_[0] =
+      //     aux_data_manager_->CopyTDPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[0], 0);
+      // // - Sync two streams.
+      // DeviceAPI::Get(device_)->SyncStreamFromTo(device_, copy_stream_, compute_stream_);
+      
+      // Opt(Zhihao): remove this in future optimizations
+      dirty_aux_data_device_ = true;
+      update_tidal_indices_ = true;
+    } else{
+      // TODO(Zhihao): fetch the indices from the offload device
+      CHECK_GT(sparse_layer_start_idx_, 0)
+          << "The sparse layer start index must be greater than 0 as we need the token re-selection layer.";
+      int64_t sparse_layer_end_idx=sparse_layer_start_idx_;
+
+      for (int i = sparse_layer_start_idx_; i < num_layers_; ++i) {
+        if (attn_kinds_[i] != AttnKind::kTidal) {
+          break;
+        }
+        sparse_layer_end_idx = i+1;
+      }
+
+      // LOG(INFO) << " sparse_layer_start_idx: " << sparse_layer_start_idx_ << " sparse_layer_end_idx: " << sparse_layer_end_idx;
+
+      for(int layer_idx = sparse_layer_start_idx_; layer_idx < sparse_layer_end_idx; ++layer_idx){
+        tidal_kv_data_manager_->ResetCompactKVCacheDataCopy();
+        for (int i = 0; i < cur_batch_size_; ++i) {
+          auto it = seq_map_.find(seq_ids[i]);
+          CHECK(it != seq_map_.end()) << "The sequence \"" << seq_ids[i]
+                                      << "\" cannot be found in KV cache.";
+          int32_t block_idx = it->second.last_block_idx;
+          const Block& block = global_block_pool_[block_idx];
+          int64_t tidal_token_budget = tidal_page_indptr_on_depths_host_[0][i + 1]-tidal_page_indptr_on_depths_host_[0][i]-num_sink_tokens_-num_window_tokens_;
+          for (int j = 0; j < tidal_token_budget; ++j) {
+            tidal_kv_data_manager_->CopyPageH2H(host_pages_[layer_idx], block.page_ids[selected_kv_indices[i*num_tidal_tokens_+j]]);
+            LOG(INFO) << "Tidal page indices: " << block.page_ids[selected_kv_indices[i*num_tidal_tokens_+j]];
+          }
+        }
+        tidal_kv_data_manager_->CommitCompactKVCacheH2DCopy(pages_[layer_idx], copy_stream_);
+        DeviceAPI::Get(device_)->StreamSync(device_, copy_stream_);
       }
     }
-
-    // // Better but has bug
-    // ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
-    //           tidal_page_indptr_on_depths_host_[0].back());
-    // tidal_page_indices_on_depths_view_[0] =
-    //     aux_data_manager_->CopyTDPageIndicesOnDepthAsync(&tidal_page_indices_on_depths_host_[0], 0);
-    // // - Sync two streams.
-    // DeviceAPI::Get(device_)->SyncStreamFromTo(device_, copy_stream_, compute_stream_);
     
-    // Opt(Zhihao): remove this in future optimizations
-    dirty_aux_data_device_ = true;
-    update_tidal_indices_ = true;
   }
 
   /************** Attention **************/
@@ -906,6 +1002,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         << "The seq_ids size (" << seq_ids.size() << ") and append_lengths size ("
         << append_lengths.size() << ") mismatch.";
     cur_batch_size_ = seq_ids.size();
+    CHECK_LE(cur_batch_size_, reserved_num_seqs_)
+        << "The batch size (" << cur_batch_size_ << ") exceeds the reserved number of sequences ("
+        << reserved_num_seqs_ << ").";
     cur_seq_ids_ = seq_ids;
     cur_append_lengths_ = append_lengths;
 
@@ -1015,6 +1114,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       HostMemoryVector& page_indices_h = page_indices_on_depths_host_[d];
 
       HostMemoryVector& tidal_page_indptr_h = tidal_page_indptr_on_depths_host_[d];
+      HostMemoryVector& tidal_page_indices_h = tidal_page_indices_on_depths_host_[d];
 
       HostMemoryVector& last_page_len_h = last_page_len_on_depths_host_[d];
       HostMemoryVector& sliding_window_offset_h = sliding_window_offset_on_depths_host_[d];
@@ -1027,6 +1127,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
       tidal_page_indptr_h.clear();
 
+      if(tidal_offload_){
+        tidal_page_indices_h.clear();
+      }
+      
       last_page_len_h.clear();
       sliding_window_offset_h.clear();
       sink_size_h.clear();
@@ -1035,6 +1139,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       page_indptr_h.push_back(0);
 
       tidal_page_indptr_h.push_back(0);
+      int64_t tidal_token_cnt = 0;
+
       for (int i = 0; i < static_cast<int>(chunked_block_ids_arr[d].size()); ++i) {
         const auto& [block_id, chunk_append_length] = chunked_block_ids_arr[d][i];
         qo_indptr_h.push_back(qo_indptr_h.back() + chunk_append_length);
@@ -1054,9 +1160,31 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             }
             if (token_budget_ > 0 && is_decode_request_) {
               CHECK_EQ(d, 0) << "Tidal is only supported with num_depth_ = 1.";
+              int64_t cur_token_count = std::min(static_cast<int64_t>(block.page_ids.size()), token_budget_);
+              CHECK_GE(cur_token_count, num_sink_tokens_) << "Token count should be greater than or equal to num_sink_tokens";
               tidal_page_indptr_h.push_back(
-                  tidal_page_indptr_h.back() +
-                  std::min(static_cast<int64_t>(block.page_ids.size()), token_budget_));
+                tidal_page_indptr_h.back() + cur_token_count
+              );
+              
+              if (tidal_offload_) {
+                // LOG(INFO) << " Block id: " << block_id << " page_size: " << block.page_ids.size();
+                for(int tidal_token_idx=0; tidal_token_idx<cur_token_count; tidal_token_idx++) {
+                  // [reserved_num_sequence * num_tidal_tokens | reserved_num_sequence * num_sink_tokens | reserved_num_sequence * num_window_tokens]
+                  if(tidal_token_idx < num_sink_tokens_){
+                    tidal_page_indices_h.push_back(tidal_token_idx + block_id * num_sink_tokens_ + reserved_num_seqs_ * num_tidal_tokens_);
+                  }
+                  else if(tidal_token_idx - num_sink_tokens_ < num_window_tokens_){
+                    tidal_page_indices_h.push_back(tidal_token_idx - num_sink_tokens_ + block_id * num_window_tokens_ + reserved_num_seqs_ * (num_tidal_tokens_ + num_sink_tokens_));
+                  }
+                  else{
+                    tidal_page_indices_h.push_back(tidal_token_cnt);
+                    tidal_token_cnt++;
+                  }
+
+                  // LOG(INFO) << " Tidal page indices: " << tidal_page_indices_h.back();
+                }
+              }
+
             }
             last_page_len_h.push_back(
                 block.seq_length == 0
@@ -1115,6 +1243,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // in the global KV cache. The mapping is used in when appending k/v values.
     q_rope_position_map_host_.clear();
     append_position_map_host_.clear();
+    sink_window_append_position_map_host_.clear();
+    sparse_decode_append_position_map_host_.clear();
     kv_transfer_remote_position_map_host_.clear();
     kv_transfer_recver_id_host_.clear();
     kv_transfer_page_to_page_local_position_map_host_.clear();
@@ -1122,9 +1252,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     kv_transfer_page_to_page_recver_id_host_.clear();
     transfer_kv_ = false;
     page_to_page_transfer_kv_ = false;
+    
     for (int i = 0; i < cur_batch_size_; ++i) {
       int64_t append_length = append_lengths[i];
       const Block& block = global_block_pool_[sequences[i]->last_block_idx];
+      if (tidal_offload_ && !is_decode_request_){
+        prefill_window_offset_host_.push_back(std::min(append_length - num_sink_tokens_, num_window_tokens_) % num_window_tokens_);
+      }
       for (int64_t pos = 0; pos < append_length; ++pos) {
         if (sequences[i]->token_tree_node_depths.empty()) {
           q_rope_position_map_host_.push_back(k_ragged_rope_pos_offset_host_[i] + pos);
@@ -1155,6 +1289,36 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                                   page_size_ +
                                               offset_in_block % page_size_);
         }
+        if(is_decode_request_){
+          LOG(INFO) << "batch " << i << " pos " << pos << " append_position_map_host_ " << append_position_map_host_.back();
+        }
+
+        if (tidal_offload_){
+          if (!is_decode_request_){
+            CHECK_GE(append_length, num_sink_tokens_) << "Append length should be greater than or equal to num_sink_tokens";
+            if(pos < num_sink_tokens_){
+              sink_window_append_position_map_host_.push_back(pos + i * num_sink_tokens_ + reserved_num_seqs_ * num_tidal_tokens_);
+            }
+            else if(pos >= append_length - num_window_tokens_){
+              sink_window_append_position_map_host_.push_back(
+                pos - std::max(num_sink_tokens_, append_length-num_window_tokens_)  + i * num_window_tokens_ + reserved_num_seqs_ * (num_tidal_tokens_ + num_sink_tokens_)
+              );
+            }
+            else{
+              sink_window_append_position_map_host_.push_back(-1);
+            }
+            // LOG(INFO) << "batch " << i << " pos " << pos << " sink_window_append_position_map_host_ " << sink_window_append_position_map_host_.back();
+          }
+          else{
+            sparse_decode_append_position_map_host_.push_back(
+              prefill_window_offset_host_[i] % num_window_tokens_  + i * num_window_tokens_ + reserved_num_seqs_ * (num_tidal_tokens_ + num_sink_tokens_)
+            );
+            prefill_window_offset_host_[i] = (prefill_window_offset_host_[i] + 1) % num_window_tokens_;
+            LOG(INFO) << "batch " << i << " pos " << pos << " sparse_decode_append_position_map_host_ " << sparse_decode_append_position_map_host_.back();
+          }
+        }
+
+
         int64_t pos_in_seq = sequences[i]->seq_length - append_length + pos;
         int64_t seq_send_start = sequences[i]->kv_transfer_metadata.start;
         if (pos_in_seq < seq_send_start) {
@@ -1282,7 +1446,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     NDArray pages = pages_[local_layer_id];
     CHECK(qkv_data.DataType() == pages.DataType());
     CHECK(o_data.DataType() == pages.DataType());
-    CHECK(attn_kinds_[layer_id] == AttnKind::kMHA);
+    CHECK(attn_kinds_[layer_id] == AttnKind::kMHA || attn_kinds_[layer_id] == AttnKind::kTidal)
+        << "Only MHA and Tidal attention are supported for AttentionWithFusedQKV.";
 
     // qkv_data: (num_total_length, num_qo_heads + 2 * num_kv_heads, qk_head_dim)
     // o_data: (num_total_length, num_qo_heads, qk_head_dim)
@@ -1368,8 +1533,29 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     AttentionInternal(layer_id, q_data, k_data, v_data, o_data_view, sm_scale);
     // Part 6. Append k/v data to kv-cache if flag "append_before_attn" is not set.
     if (!append_before_attn_) {
-      f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
+      CHECK(!is_decode_request_);
+      if(tidal_offload_ && attn_kinds_[local_layer_id]==AttnKind::kTidal && !is_decode_request_){
+        
+        // append sink and window tokens
+        f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
+          sink_window_append_position_map_view_);
+
+        // offload prefilled kv to host for tidal layers
+        f_transpose_append_mha_.value()(tmp_device_pages_[0], k_data, v_data,
+          append_position_map_view_);
+        DeviceAPI::Get(device_)->SyncStreamFromTo(device_, compute_stream_, copy_stream_);
+        NDArray host_pages_view_ = host_pages_[local_layer_id].CreateView({total_seq_length, 2, num_kv_heads_, qk_head_dim_}, k_data->dtype);
+        NDArray device_pages_view_ = tmp_device_pages_[0].CreateView({total_seq_length, 2, num_kv_heads_, qk_head_dim_}, k_data->dtype);
+        DLTensor cp_dst = *host_pages_view_.operator->();
+        DLTensor cp_src = *device_pages_view_.operator->();
+        NDArray::CopyFromTo(&cp_src, &cp_dst, copy_stream_);
+        DeviceAPI::Get(device_)->StreamSync(device_, copy_stream_);
+      }
+      else{
+        f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
                                       append_position_map_view_);
+      }
+
     }
   }
 
@@ -1385,6 +1571,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     CHECK(o_data.DataType() == pages.DataType());
     CHECK(qk_inner_product_data.DataType() == pages.DataType());
     CHECK(attn_kinds_[layer_id] == AttnKind::kMHA);
+    CHECK_LT(layer_id, num_layers_ - 1);
+
+    sparse_layer_start_idx_ = layer_id + 1;
 
     // qkv_data: (num_total_length, num_qo_heads + 2 * num_kv_heads, qk_head_dim)
     // o_data: (num_total_length, num_qo_heads, qk_head_dim)
@@ -1480,13 +1669,15 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   void SparseAttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data, Optional<NDArray> mask,
                                    NDArray o_data, double sm_scale) final {
     // Part 1. Shape and dtype check.
+    CHECK(is_decode_request_);
     int64_t local_layer_id = layer_id - layer_id_begin_offset_;
     CHECK_GE(local_layer_id, 0);
     CHECK_LT(local_layer_id, num_layers_);
     NDArray pages = pages_[local_layer_id];
     CHECK(qkv_data.DataType() == pages.DataType());
     CHECK(o_data.DataType() == pages.DataType());
-    CHECK(attn_kinds_[layer_id] == AttnKind::kMHA);
+    CHECK(attn_kinds_[layer_id] == AttnKind::kTidal);
+    CHECK_GT(sparse_layer_start_idx_, 0);
 
     // qkv_data: (num_total_length, num_qo_heads + 2 * num_kv_heads, qk_head_dim)
     // o_data: (num_total_length, num_qo_heads, qk_head_dim)
@@ -1544,8 +1735,14 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // Part 3. Append k/v data to kv-cache if flag "append_before_attn" is set.
     CHECK(f_transpose_append_mha_.defined());
     if (append_before_attn_) {
-      f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
-                                      append_position_map_view_);
+      if(tidal_offload_){
+        f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
+          sparse_decode_append_position_map_view_);
+      }
+      else{
+        f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
+          append_position_map_view_);
+      }
     }
     // Part 4: KV transfer
     if (page_to_page_transfer_kv_) {
@@ -1572,8 +1769,28 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     SparseAttentionInternal(layer_id, q_data, k_data, v_data, o_data_view, sm_scale);
     // Part 6. Append k/v data to kv-cache if flag "append_before_attn" is not set.
     if (!append_before_attn_) {
+      CHECK(false);
       f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
                                       append_position_map_view_);
+    }
+    // D2H transfer of current kv if tidal_offload is enabled
+    if(tidal_offload_){
+      // pages_[local_layer_id]: sparse_decode_append_position_map_view_ -> host_pages_[local_layer_id]: append_position_map_view_
+      DeviceAPI::Get(device_)->SyncStreamFromTo(device_, compute_stream_, copy_stream_);
+      CHECK_EQ(pages_[local_layer_id].DataType(), host_pages_[local_layer_id].DataType());
+      for(size_t i=0; i<append_position_map_host_.size(); i++){
+        int64_t src_offset = sparse_decode_append_position_map_host_[i] * num_kv_heads_ * page_size_ * qk_head_dim_ * pages_[local_layer_id].DataType().bytes();
+        NDArray src_arr = pages_[local_layer_id].CreateView({1, 2, num_kv_heads_, page_size_, qk_head_dim_}, k_data->dtype, src_offset);
+        DLTensor cp_src = *src_arr.operator->();
+
+        int64_t dst_offset = append_position_map_host_[i] * num_kv_heads_ * page_size_ * qk_head_dim_ * host_pages_[local_layer_id].DataType().bytes();
+        NDArray dst_arr = host_pages_[local_layer_id].CreateView({1, 2, num_kv_heads_, page_size_, qk_head_dim_}, k_data->dtype, dst_offset);
+        DLTensor cp_dst = *dst_arr.operator->();
+        NDArray::CopyFromTo(&cp_src, &cp_dst, copy_stream_);
+
+        DeviceAPI::Get(device_)->StreamSync(device_, copy_stream_);
+      }
+      exit(0);
     }
   }
 
@@ -2216,7 +2433,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             v_head_dim_, /*causal=*/true, copy_stream_);
       }
     }
-    // LOG(INFO) << " is_decode_request: " << is_decode_request_ << " num_depth: " << num_depths_;
     for (int d = 0; d < num_depths_; ++d) {
       if (page_indices_on_depths_view_[d]->shape[0] == 0) {
         continue;
@@ -2447,7 +2663,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                       compute_stream_);
       } else {
         // Use prefill kernel for depth d
-        // LOG(INFO) << "MHACrossAttnInternal: Use prefill kernel for depth d";
         ICHECK_NOTNULL(f_prefill);
         f_prefill->MHA(d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
                        page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
@@ -2698,8 +2913,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // Tidal Page indices update
     // Opt(Zhihao): This is a temporary solution to update indices, we don't need to replan the
     // kernel
-
-    if (token_budget_ > 0 && is_decode_request_ && update_tidal_indices_) {
+    if (token_budget_ > 0 && is_decode_request_ && (update_tidal_indices_ || tidal_offload_)) {
       ICHECK_EQ(tidal_page_indices_on_depths_host_[0].size(),
                 tidal_page_indptr_on_depths_host_[0].back());
       tidal_page_indices_on_depths_view_[0] =
@@ -2707,7 +2921,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
           0);
       update_tidal_indices_ = false;
     }
-
     // 5. length_info_on_depths
     // last_page_len_on_depths_host_;
     // sliding_window_offset_on_depths_host_;
@@ -2745,6 +2958,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // 9. append_position_map
     append_position_map_view_ =
         aux_data_manager_->CopyAppendPositionMapAsync(&append_position_map_host_);
+    sink_window_append_position_map_view_ =
+        aux_data_manager_->CopyAppendPositionMapAsync(&sink_window_append_position_map_host_);
+    sparse_decode_append_position_map_view_ =
+        aux_data_manager_->CopyAppendPositionMapAsync(&sparse_decode_append_position_map_host_);
     // 10. kv_transfer_remote_position_map
     kv_transfer_remote_position_map_view_ = aux_data_manager_->CopyKVTransferRemotePositionMapAsync(
         &kv_transfer_remote_position_map_host_);
@@ -2868,12 +3085,18 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
         attn_kinds_vec.push_back(static_cast<AttnKind>(attn_kind));
       }
 
-      CHECK_EQ(cache_config.size(), 5);
+      CHECK_EQ(cache_config.size(), 9);
       int64_t reserved_num_seqs = cache_config[0];
       int64_t total_token_capacity = cache_config[1];
       int64_t prefill_chunk_size = cache_config[2];
       int64_t page_size = cache_config[3];
       bool support_sliding_window = cache_config[4];
+      int64_t tidal_token_budget = cache_config[5];
+      int64_t num_sink_tokens = cache_config[6];
+      int64_t num_window_tokens = cache_config[7];
+      CHECK_LE(num_window_tokens+num_sink_tokens, tidal_token_budget)
+          << "num_window_tokens+num_sink_tokens must be less than or equal to tidal_token_budget.";
+      bool tidal_offload = cache_config[8];
       int64_t num_total_pages = (total_token_capacity + page_size - 1) / page_size + 1;
       if (support_sliding_window) {
         // When sliding window is enabled, each sequence may use two more pages at most.
@@ -2883,8 +3106,9 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
       // Some `PackedFunc()` here are placeholders that will be filled.
       ObjectPtr<PagedAttentionKVCacheObj> n = make_object<PagedAttentionKVCacheObj>(
           page_size, num_layers, layer_id_begin_offset, layer_id_end_offset, num_qo_heads,
-          num_kv_heads, qk_head_dim, v_head_dim, attn_kinds_vec, reserved_num_seqs, num_total_pages,
-          prefill_chunk_size, support_sliding_window, RoPEMode(rope_mode), rotary_scale,
+          num_kv_heads, qk_head_dim, v_head_dim, attn_kinds_vec, reserved_num_seqs, 
+          tidal_token_budget, num_sink_tokens, num_window_tokens, tidal_offload, 
+          num_total_pages, prefill_chunk_size, support_sliding_window, RoPEMode(rope_mode), rotary_scale,
           rotary_theta, std::move(rope_ext_factors), enable_kv_transfer,  //
           init->dtype, init->device,                                      //
           std::move(f_transpose_append_mha), std::move(f_transpose_append_mla),
